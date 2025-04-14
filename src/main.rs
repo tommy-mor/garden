@@ -129,9 +129,11 @@ fn run_python_script(script: &PathBuf) -> Result<(Py<PyDict>, Py<PyDict>)> {
 fn build_locals_list(locals: &Py<PyDict>, globals: &Py<PyDict>) -> Vec<ListItem<'static>> {
     Python::with_gil(|py| {
         let mut items = vec![];
-
-        items.push(ListItem::new("Hello"));
-
+        let keys = locals.bind(py).keys();
+        for key in keys {
+            let value = locals.bind(py).get_item(key.clone());
+            items.push(ListItem::new(format!("{:?}: {:?}", key, value)));
+        }
 
         items
     })
