@@ -1,97 +1,116 @@
-Absolutely—here’s a deep yet clear explanation of the **examples > types** mentality, weaving in your original quotes from the `readme.md` and tying them to Garden’s core philosophy:
+Here’s a **step-by-step implementation plan** for building an MVP of **Garden**—focusing on delivering early value, while laying a foundation for the full vision.
 
 ---
 
-## 🌱 **Examples > Types**  
-*“It’s much easier for me to generalize from the concrete than concretize from the general.”*  
-— *a professor once told me*
+## 🌱 MVP Implementation Plan: “Tend Your Code”
 
-This line captures the **examples-first mindset** perfectly.
-
----
-
-### 🧠 Traditional Type Systems: General → Specific
-
-Most statically typed languages ask you to **begin with an abstraction**:
-- Define the shape of a value (`struct`, `interface`, `class`, etc)
-- Then write functions that promise to *always* respect that shape
-- Then supply values that must *fit* the declared shape
-
-This works—but it’s upside-down for many people’s minds.
-
-You often don’t know *the shape* of the thing until you’ve *seen it run*.
+### 🔹 GOAL:  
+A developer writes expressions in `.expr` files.  
+They see **live evaluated values** and **expression paths** in a **Tauri UI**, updated automatically as they edit the file.
 
 ---
 
-### 🌾 Garden's Philosophy: Specific → General
+## ✅ Phase 1: File-Based MVP
 
-In Garden, you start from a **real value**:
-- You write an expression
-- You see what it *evaluates to*
-- That result is cached and viewable side-by-side with the expression
-- You can generalize later if needed
+### 🧾 1. **Syntax & File Format**
+- Choose `.expr` as the file extension.
+- Design a simple, JSON-like or Rust-like expression syntax.
+  - Example:
+    ```expr
+    let name = "karen"
+    let age = 27
+    name + " is " + age
+    ```
+- Each `let` becomes a path in the value tree.
 
-It’s like a REPL that **doesn't forget**.
+---
 
-Instead of saying, “this will always return a `Map<String, Int>`,” you say:
+### 🌳 2. **Tree-sitter Integration**
+- Use [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) to parse `.expr` files.
+- Build a structural AST for each file.
+- Assign **stable paths** to each node (e.g., `["root", "age"]`, `["root", "name_plus_age"]`).
 
-```rune
-let scores = {"alice": 10, "bob": 12}
+---
+
+### ⚙️ 3. **Interpreter Runtime**
+- Write a naive interpreter in **Rust**:
+  - Executes ASTs expression-by-expression.
+  - Stores values per expression path (`.garden/cache/*.value`).
+  - On error, store failure logs as part of the value object.
+
+- Optional: support basic partial evaluation or memoization.
+
+---
+
+### 🖥️ 4. **File Watcher + Runtime Driver**
+- Use `notify` (Rust crate) to **watch `.expr` files**.
+- Re-interpret changed files and update `.value` cache.
+
+---
+
+## 🌼 Phase 2: Tauri UI
+
+### 📊 5. **Visual Interface**
+- Build a simple **Tauri app** that:
+  - Lists all parsed files.
+  - Shows each **expression path** and its live **value**.
+  - Highlights **cache freshness** (e.g., stale, fresh, error).
+  - On click: show raw expression, cached value, logs.
+
+---
+
+## 🛠️ Phase 3: Interactivity + Extras
+
+### ✏️ 6. **Inline Editing or Expression Playground**
+- Optional but powerful: allow editing expressions directly in the Tauri UI (projectional style).
+- Or, have a “Playground” where you test expressions with live feedback.
+
+---
+
+### 🔌 7. **Babashka Pod Integration**
+- Allow `.expr` expressions to call out to pods.
+- Example: `"Hello, " + (pod.fetchUserName :id 42)`
+
+---
+
+## 🚀 Stretch Goals for v2
+
+- Store expression history over time.
+- Add a time-travel scrubber per value.
+- Support expression diffs and “why did this value change?”
+- Compose `.expr` files into modules (i.e., `garden/main.expr`, `garden/math.expr`)
+- Integrate Sorter inside Garden to rank expressions by usefulness or clarity.
+- Hosted Garden with team collaboration and replayable logs.
+
+---
+
+## 🔁 Summary MVP Loop
+
+```mermaid
+flowchart TD
+  A[Developer edits .expr file] --> B[Tree-sitter parses file]
+  B --> C[Interpreter evaluates expressions]
+  C --> D[.value cache updated]
+  D --> E[Tauri UI reads cache + AST]
+  E --> F[Displays: paths + values + logs]
+  F --> A
 ```
 
-…and Garden just stores that value. You don’t declare a type—you **show it an example**.
+---
 
-If the values *change* and become heterogeneous later, Garden lets you explore those transitions too.
+## ✨ What You’ll Get in the MVP
+
+- Reactive, file-based development.
+- Every expression has a **live value** and **stable identity**.
+- You can explore your code **like a data tree**, not a static script.
+- It’s tangible, introspectable, and already more powerful than a REPL.
 
 ---
 
-## 🧾 Quotes from Your README
+Would you like scaffolding code for:
+- the file watcher?
+- interpreter starter?
+- Tree-sitter config?
+- Tauri UI tree renderer?
 
-> “In hindsight, so much of what we hype up as ‘exploratory programming’ in the REPL is really just coping with the lack of useful type information.”
-
-This is the paradox.
-
-The REPL feels *fun*, because it gives **live values**.
-
-But it's also fragile. Once the session ends, those values disappear. You're left with a transcript that doesn't travel with the code.
-
-**Garden fixes this.** It turns exploratory values into stable, cacheable knowledge. The REPL becomes a living document.
-
----
-
-> “The values of a program deserve to be tracked in git, not just the source of a program.”  
-> — *your opinion*
-
-This is the crux of it.
-
-If you believe in “types as documentation,” **then values are better documentation**. They’re precise. They carry edge cases. They show what the code *did*, not just what it *claims* to do.
-
-So Garden doesn't just cache values—it **versions them**.
-
-When you commit code, you’re also committing:
-- What each expression evaluated to
-- What changed
-- Which parts were re-used
-- What broke
-
----
-
-## 🔍 Summary
-
-### Why **Examples > Types** in Garden:
-
-| Types | Examples |
-|-------|----------|
-| Abstract | Concrete |
-| Prescriptive | Descriptive |
-| Promise-based | History-based |
-| Static | Live |
-| Debugger-unfriendly | Inspectable |
-| Often theoretical | Always real |
-
-In Garden, code is not a **guess** about the future—it's a **record** of what happened.
-
-From there, you can always generalize.  
-But now, you're generalizing from soil, not from blueprints.
-
-Would you like me to mock up a side-by-side view of expression + value + inferred shape, to show this philosophy in action?
+Just say the word, and we can start growing 🌿
