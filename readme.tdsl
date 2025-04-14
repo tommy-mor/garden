@@ -1,3 +1,4 @@
 todo
   tree sitter grammar, for rustling type syntax. (rune)
-  tuari gui inteface, showing all named values and CRUD on the cache
+  TUI inteface, showing all named values and CRUD on the cache.
+  nrepl support????
