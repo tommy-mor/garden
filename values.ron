@@ -1,0 +1,5 @@
+{
+    "fetch/fact": "About 37% of American homes today have at least 1 cat.",
+    "fetch/url": "https://catfact.ninja/fact",
+    "fetch/res": "{\"fact\":\"About 37% of American homes today have at least 1 cat.\",\"length\":54}",
+}
