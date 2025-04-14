@@ -27,7 +27,7 @@ let user = {
   age: 27
 };
 
-for "each_user" in db.users {
+for each_user in db.users {
   let greeting = "Hello, " + each_user.name;
   log(greeting);
 }
@@ -36,7 +36,7 @@ for "each_user" in db.users {
 Each expression (e.g. `user`, `greeting`, `log(...)`) gets a **structural path** like:
 ```
 ["root", "user"]
-["root", "each_user_loop", 3, "greeting"]
+["root", "loop#each_user", 3, "greeting"]
 ```
 
 ---
@@ -94,7 +94,6 @@ Garden is not just a language or a REPL. It is a **projectional, reactive develo
 ## 🔌 Extensibility & Integration
 
 - **Babashka pods** – Bring in shell, crypto, databases, etc.
-- **Sortercorp tie-in** – Sorter can be hosted within Garden, ranking `.rune` expressions.
 - **Version control** – Cache and value diffs track across Git commits.
 - **AI agents** – Future version can include GPT-like copilots that reason per expression path.
 

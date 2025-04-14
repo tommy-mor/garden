@@ -79,7 +79,6 @@ They see **live evaluated values** and **expression paths** in a **Tauri UI**, u
 - Add a time-travel scrubber per value.
 - Support expression diffs and “why did this value change?”
 - Compose `.expr` files into modules (i.e., `garden/main.expr`, `garden/math.expr`)
-- Integrate Sorter inside Garden to rank expressions by usefulness or clarity.
 - Hosted Garden with team collaboration and replayable logs.
 
 ---
