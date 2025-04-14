@@ -1,11 +1,10 @@
 [package]
-name = "garden"
-version = "0.0.0"
+name = "garden_repl"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-reqwest = { version = "0.11", features = ["blocking", "json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-ron = "0.8"
-
+pyo3 = { version = "0.18", features = ["extension-module"] }
+ratatui = "0.20.0"
+crossterm = "0.25.0"
+anyhow = "1.0.0"
