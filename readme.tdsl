@@ -2,3 +2,5 @@ todo
   tree sitter grammar, for rustling type syntax. (rune)
   TUI inteface, showing all named values and CRUD on the cache.
   nrepl support????
+
+  weavejester/hashp equivalent

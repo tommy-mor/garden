@@ -1,4 +1,4 @@
-Absolutely—here’s a clear breakdown that explains:
+Absolutely—here's a clear breakdown that explains:
 
 ---
 
@@ -16,11 +16,11 @@ But...
 
 ---
 
-## 😩 Why We’re Not Building That Right Now
+## 😩 Why We're Not Building That Right Now
 
 Despite how dreamy it sounds, going full Bevy/editor engine comes with immense cost:
 
-- **Too much surface area**: You’d have to build AST editing, layout rendering, zoom/navigation, undo/redo, file management... just to get started.
+- **Too much surface area**: You'd have to build AST editing, layout rendering, zoom/navigation, undo/redo, file management... just to get started.
 - **You reinvent the editor**: Syntax highlighting, selection, copy/paste, even basic text input—all have to be rebuilt.
 - **Harder AI interop**: AI copilots work best in text buffers. You lose LSP support, autocomplete, and other ecosystem wins.
 - **Slower feedback loop**: Shipping, iterating, and onboarding devs becomes dramatically harder.
@@ -41,13 +41,13 @@ We're targeting a *text-first, AST-powered environment* that integrates beautifu
 | **Parser** | [Tree-sitter](https://tree-sitter.github.io/) | Extract structured AST from `.expr` files |
 | **Runtime** | Rust interpreter | Evaluate expressions, store/cache values |
 | **Watcher** | Filewatcher | Detect changes and trigger re-evaluation |
-| **UI** | Tauri app | Visualize the live tree, values, logs, diffs |
+| **UI** | Ratatui TUI | Display cached values, provide cache CRUD interface |
 
 ### 🚀 Why This Is Better *Now*:
 
 - **You keep your editor** – No new text input engine to build.
 - **Tree-sitter gives us AST for free** – Efficient, incremental parsing.
-- **Live Tauri UI augments your code** – Shows expression tree, values, logs.
+- **Simple TUI shows runtime state** – Shows cached values and allows cache inspection/manipulation.
 - **Interpreted runtime means fast iteration** – No need to recompile.
 - **Composable stack** – Each layer (editor, parser, runtime, UI) is pluggable and open.
 
@@ -67,19 +67,3 @@ But for now, we get:
 - Easy developer adoption
 - Focused scope
 - MVP we can actually finish
-
----
-
-## ✨ Summary
-
-A full projectional editor in Bevy would be *visually stunning*, but it’s a 3D chessboard with infinite pieces.
-
-Instead, we’re building Garden like a greenhouse:
-- The dirt is `.expr` files
-- The roots are Tree-sitter ASTs
-- The water is the interpreter
-- The glass is Tauri UI
-
-This lets us **see everything**, **change anything**, and **ship soon**, while still dreaming of the full immersive garden later.
-
-Would you like a diagram of this flow? Or a prototype scaffold for the `.expr + .value + UI` stack?
