@@ -1,116 +1,114 @@
-Here’s a **step-by-step implementation plan** for building an MVP of **Garden**—focusing on delivering early value, while laying a foundation for the full vision.
+You're so close to something magical here. Let’s define a **minimum viable product (MVP)** for your **value-first Python interpreter with a Rust TUI**.
 
 ---
 
-## 🌱 MVP Implementation Plan: “Tend Your Code”
-
-### 🔹 GOAL:  
-A developer writes expressions in `.expr` files.  
-They see **live evaluated values** and **expression paths** in a **Tauri UI**, updated automatically as they edit the file.
+## 🌱 **MVP: "Garden for Python"**  
+> A TUI-based Python interpreter where your code lives in a file,  
+> and your **live values appear beside it**, with automatic updates.
 
 ---
 
-## ✅ Phase 1: File-Based MVP
+## 🛠️ **MVP Core Features**
 
-### 🧾 1. **Syntax & File Format**
-- Choose `.expr` as the file extension.
-- Design a simple, JSON-like or Rust-like expression syntax.
-  - Example:
-    ```expr
-    let name = "karen"
-    let age = 27
-    name + " is " + age
-    ```
-- Each `let` becomes a path in the value tree.
+### 🧠 1. **Rust TUI that Reads a Python File**
+- Continuously watches a `.py` file (like `main.py`)
+- Parses it for top-level expressions/definitions (basic AST)
+- Displays code on the left, **evaluated values** on the right
+  ```python
+  a = 2 + 2      # 4
+  b = a * 10     # 40
+  ```
 
----
+### 🔄 2. **Evaluates New/Changed Expressions Automatically**
+- On save or keypress, Rust re-runs the changed expressions via PyO3
+- Caches values by expression path (`["main.py", "b"]`) in memory or RocksDB
 
-### 🌳 2. **Tree-sitter Integration**
-- Use [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) to parse `.expr` files.
-- Build a structural AST for each file.
-- Assign **stable paths** to each node (e.g., `["root", "age"]`, `["root", "name_plus_age"]`).
+### 🔍 3. **Scope View (Optional but Killer)**
+- Press a key (`s`) → open a right panel showing:
+  ```
+  Scope:
+  a: 4
+  b: 40
+  ```
 
----
-
-### ⚙️ 3. **Interpreter Runtime**
-- Write a naive interpreter in **Rust**:
-  - Executes ASTs expression-by-expression.
-  - Stores values per expression path (`.garden/cache/*.value`).
-  - On error, store failure logs as part of the value object.
-
-- Optional: support basic partial evaluation or memoization.
-
----
-
-### 🖥️ 4. **File Watcher + Runtime Driver**
-- Use `notify` (Rust crate) to **watch `.expr` files**.
-- Re-interpret changed files and update `.value` cache.
+### ⚠️ 4. **Shows Errors as Values**
+- If an expression fails, show the error:
+  ```python
+  c = 1 / 0       # ZeroDivisionError: division by zero
+  ```
 
 ---
 
-## 🌼 Phase 2: Tauri UI
-
-### 📊 5. **Visual Interface**
-- Build a simple **Tauri app** that:
-  - Lists all parsed files.
-  - Shows each **expression path** and its live **value**.
-  - Highlights **cache freshness** (e.g., stale, fresh, error).
-  - On click: show raw expression, cached value, logs.
-
----
-
-## 🛠️ Phase 3: Interactivity + Extras
-
-### ✏️ 6. **Inline Editing or Expression Playground**
-- Optional but powerful: allow editing expressions directly in the Tauri UI (projectional style).
-- Or, have a “Playground” where you test expressions with live feedback.
+## ✨ **Nice-to-Haves (v0.2+)**
+- Click/arrow key to jump to expression definitions
+- Press `r` to re-evaluate a single line or value
+- Press `x` to invalidate a cached value
+- Show **diffed values** if they change
+  ```
+  b: 40 → 50  ✅
+  ```
 
 ---
 
-### 🔌 7. **Babashka Pod Integration**
-- Allow `.expr` expressions to call out to pods.
-- Example: `"Hello, " + (pod.fetchUserName :id 42)`
+## 🔧 Architecture Sketch
 
----
-
-## 🚀 Stretch Goals for v2
-
-- Store expression history over time.
-- Add a time-travel scrubber per value.
-- Support expression diffs and “why did this value change?”
-- Compose `.expr` files into modules (i.e., `garden/main.expr`, `garden/math.expr`)
-- Integrate Sorter inside Garden to rank expressions by usefulness or clarity.
-- Hosted Garden with team collaboration and replayable logs.
-
----
-
-## 🔁 Summary MVP Loop
-
-```mermaid
-flowchart TD
-  A[Developer edits .expr file] --> B[Tree-sitter parses file]
-  B --> C[Interpreter evaluates expressions]
-  C --> D[.value cache updated]
-  D --> E[Tauri UI reads cache + AST]
-  E --> F[Displays: paths + values + logs]
-  F --> A
+```text
+TUI (Ratatui) ─────┬── Reads .py file on change
+                   │
+                   ├── Extracts top-level expressions (Rust AST walker)
+                   │
+                   ├── Evaluates each in PyO3 (exec in context dict)
+                   │
+                   ├── Stores value in memory cache or RocksDB
+                   │
+                   └── Displays (expr, value) pairs in table
 ```
 
 ---
 
-## ✨ What You’ll Get in the MVP
+## 👇 Example Experience
 
-- Reactive, file-based development.
-- Every expression has a **live value** and **stable identity**.
-- You can explore your code **like a data tree**, not a static script.
-- It’s tangible, introspectable, and already more powerful than a REPL.
+```
++----------------------------+-------------------------+
+|         Code              |         Value           |
++----------------------------+-------------------------+
+| a = 2 + 2                | 4                       |
+| b = a * 10               | 40                      |
+| c = b / 0                | ZeroDivisionError       |
++----------------------------+-------------------------+
+Press [r] to re-eval, [s] for scope, [q] to quit
+```
 
 ---
 
-Would you like scaffolding code for:
-- the file watcher?
-- interpreter starter?
-- Tree-sitter config?
-- Tauri UI tree renderer?
+## 🧱 File Structure
 
-Just say the word, and we can start growing 🌿
+```text
+project/
+├── garden
+│   └── main.rs          <-- Rust TUI (cargo run)
+├── main.py              <-- User-written Python file
+└── cache/
+    └── values.ron       <-- Optional value cache file
+```
+
+---
+
+## 🧠 Why This Is the Perfect MVP
+
+- **Simple mental model:** “Edit file, see values.”
+- **No projectional editing yet** — keep user in their own `.py` file.
+- **Immediate payoff:** Python devs love this kind of loop.
+- **Backend extensibility:** easily plug into RocksDB or fancier caching later.
+- **Bridges both worlds:** REPL joy + file-based traceability.
+
+---
+
+## 🔜 Next Steps
+
+If this resonates, I can sketch:
+- A code walkthrough (basic Rust TUI + PyO3 + file watcher)
+- How to cache values structurally (e.g. hash exprs or pathify by line number)
+- A growth roadmap toward full Garden semantics
+
+Would you like code scaffolding for this MVP in Rust?
