@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     execute,
 };
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     // 1) Parse CLI args for .py file
     let script_path = std::env::args()
         .nth(1)
-        .expect("Usage: garden_repl <script.py>");
+        .expect("Usage: garden <script.py>");
     let script_path = PathBuf::from(script_path);
 
     // 2) Initialize UI
@@ -65,6 +65,10 @@ fn main() -> Result<()> {
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
+                    // Handle Ctrl+C
+                    KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                        break;
+                    }
                     KeyCode::Char(c) => {
                         // Add typed characters to input buffer
                         input_buffer.push(c);
@@ -76,7 +80,7 @@ fn main() -> Result<()> {
                         // On ENTER, evaluate the buffer in Python
                         let code = input_buffer.trim();
                         if !code.is_empty() {
-                            evaluate_in_python(code, &py_locals, &py_globals)?;
+                            println!("code {:?}", code);
                         }
                         input_buffer.clear();
                     }
@@ -92,68 +96,43 @@ fn main() -> Result<()> {
 
     // 5) Cleanup
     disable_raw_mode()?;
-    let mut stdout = terminal.into_inner().into_raw_mode()?;
+    let mut stdout = terminal.backend_mut();
     execute!(stdout, LeaveAlternateScreen)?;
     Ok(())
 }
 
-/// Run the user’s Python script and return references to the Python locals/globals
+use std::ffi::CString;
+
+/// Run the user's Python script and return references to the Python locals/globals
 fn run_python_script(script: &PathBuf) -> Result<(Py<PyDict>, Py<PyDict>)> {
     let code = std::fs::read_to_string(script)
         .with_context(|| format!("Unable to read Python script {:?}", script))?;
+    let code = CString::new(code).unwrap();
 
-    let gil = Python::acquire_gil();
-    let py = gil.python();
+    Python::with_gil(|py| {
+        let globals = PyDict::new(py);
+        let locals = PyDict::new(py);
 
-    // We'll create a new dict for globals, which also serves as locals at top-level
-    let globals = PyDict::new(py);
-    let locals = PyDict::new(py);
+        // Insert builtins
+        globals.set_item("__builtins__", py.import("builtins")?)?;
 
-    // Insert builtins
-    globals.set_item("__builtins__", py.import("builtins")?)?;
-
-    // Execute the script
-    py.run(&code, Some(globals), Some(locals))
+        // Execute the script
+        py.run(&code, Some(&globals), Some(&locals))
         .with_context(|| format!("Failed to execute script {:?}", script))?;
 
-    // We return references that are valid for this Python interpreter lifetime
-    Ok((locals.into(), globals.into()))
-}
-
-/// Evaluate a line of code in the existing Python locals/globals
-fn evaluate_in_python(code: &str, locals: &Py<PyDict>, globals: &Py<PyDict>) -> Result<()> {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
-
-    let locals_ref = locals.as_ref(py);
-    let globals_ref = globals.as_ref(py);
-
-    // Evaluate the code. This is a simplistic approach (exec for statements)
-    py.run(code, Some(globals_ref), Some(locals_ref))
-        .with_context(|| format!("Failed to eval: {}", code))?;
-
-    Ok(())
+        // We return references that are valid for this Python interpreter lifetime
+        Ok((locals.into(), globals.into()))
+    })
 }
 
 /// Build a list of variables from the Python local scope
 fn build_locals_list(locals: &Py<PyDict>, globals: &Py<PyDict>) -> Vec<ListItem<'static>> {
-    let gil = Python::acquire_gil();
-    let py = gil.python();
+    Python::with_gil(|py| {
+        let mut items = vec![];
 
-    let mut items = vec![];
+        items.push(ListItem::new("Hello"));
 
-    // Combine locals & globals
-    // This is naive; you might want to deduplicate keys, or skip private names, etc.
-    let local_vars = locals.as_ref(py).items();
-    for (k, v) in local_vars {
-        let item_str = format!("{} = {:?}", k, v);
-        items.push(ListItem::new(item_str));
-    }
-    let global_vars = globals.as_ref(py).items();
-    for (k, v) in global_vars {
-        let item_str = format!("{} = {:?}", k, v);
-        items.push(ListItem::new(item_str));
-    }
 
-    items
+        items
+    })
 }
