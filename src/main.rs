@@ -5,21 +5,39 @@ use serde::{Serialize, Deserialize};
 use serde_json::Value as JsonValue;
 use ron::ser::to_string_pretty;
 use ron::ser::PrettyConfig;
+use std::iter::Peekable;
+use std::str::Chars;
 
 // === TYPES ===
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
+enum ExprAst {
+    Symbol(String),
+    Number(i64),
+    List(Vec<ExprAst>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Value {
-    Str(String),
-    Json(JsonValue),
+    Number(i64),
 }
 
 #[derive(Debug)]
-struct Expr {
-    path: Vec<String>, // e.g. ["fetch", "url"]
-    eval: fn(&HashMap<String, Value>) -> Value,
+enum Error {
+    ParseError(String),
+    EvalError(String),
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::ParseError(msg) => write!(f, "Parse Error: {}", msg),
+            Error::EvalError(msg) => write!(f, "Evaluation Error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 // === HOST FUNCTIONS ===
 
@@ -31,59 +49,187 @@ fn http_get(url: &str) -> String {
     body
 }
 
-fn json_parse(s: &str) -> JsonValue {
-    serde_json::from_str(s).expect("Failed to parse JSON")
+// === Parser ===
+
+fn parse_expr(tokens: &mut Peekable<Chars>) -> Result<ExprAst, Error> {
+    match tokens.peek() {
+        Some(&'(') => {
+            tokens.next();
+            let mut list = Vec::new();
+            while tokens.peek() != Some(&')') {
+                while tokens.peek().map_or(false, |c| c.is_whitespace()) {
+                    tokens.next();
+                }
+                if tokens.peek() == Some(&')') {
+                    break;
+                }
+                if tokens.peek().is_none() {
+                    return Err(Error::ParseError("Unexpected end of input, missing ')'".to_string()));
+                }
+                list.push(parse_expr(tokens)?);
+                while tokens.peek().map_or(false, |c| c.is_whitespace()) {
+                    tokens.next();
+                }
+            }
+            tokens.next();
+            Ok(ExprAst::List(list))
+        }
+        Some(_) => {
+            let mut atom = String::new();
+            while let Some(&c) = tokens.peek() {
+                if c.is_whitespace() || c == '(' || c == ')' {
+                    break;
+                }
+                atom.push(tokens.next().unwrap());
+            }
+
+            if atom.is_empty() {
+                return Err(Error::ParseError("Expected token, found none".to_string()));
+            }
+
+            match atom.parse::<i64>() {
+                Ok(n) => Ok(ExprAst::Number(n)),
+                Err(_) => Ok(ExprAst::Symbol(atom)),
+            }
+        }
+        None => Err(Error::ParseError("Unexpected end of input".to_string())),
+    }
 }
 
-// === HARDCODED PROGRAM ===
+fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
+    let mut tokens = input.chars().peekable();
+    let mut ast_nodes = Vec::new();
 
-fn garden_program() -> Vec<Expr> {
-    vec![
-        Expr {
-            path: vec!["fetch".into(), "url".into()],
-            eval: |_| Value::Str("https://catfact.ninja/fact".into()),
-        },
-        Expr {
-            path: vec!["fetch".into(), "res".into()],
-            eval: |ctx| {
-                if let Value::Str(url) = ctx["fetch/url"].clone() {
-                    Value::Str(http_get(&url))
-                } else {
-                    panic!("Expected string for url")
+    while tokens.peek().is_some() {
+        while tokens.peek().map_or(false, |c| c.is_whitespace()) {
+            tokens.next();
+        }
+        if tokens.peek().is_none() {
+            break;
+        }
+        ast_nodes.push(parse_expr(&mut tokens)?);
+    }
+
+    Ok(ast_nodes)
+}
+
+// === Evaluator ===
+fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Error> {
+    match ast {
+        ExprAst::Symbol(s) => context
+            .get(s)
+            .cloned()
+            .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", s))),
+        ExprAst::Number(n) => Ok(Value::Number(*n)),
+        ExprAst::List(list) => {
+            if list.is_empty() {
+                // Handle empty list if needed, maybe return Nil or error
+                return Err(Error::EvalError("Cannot evaluate empty list".to_string()));
+            }
+
+            // First element should be the operator/function
+            let op_node = &list[0];
+            let args = &list[1..];
+
+            match op_node {
+                ExprAst::Symbol(op) => {
+                    match op.as_str() {
+                        "def" => {
+                            if args.len() != 2 {
+                                return Err(Error::EvalError(format!(
+                                    "'def' expects 2 arguments, got {}",
+                                    args.len()
+                                )));
+                            }
+                            let var_name_node = &args[0];
+                            let value_node = &args[1];
+
+                            if let ExprAst::Symbol(var_name) = var_name_node {
+                                let value = eval(value_node, context)?;
+                                context.insert(var_name.clone(), value.clone());
+                                Ok(value) // 'def' evaluates to the assigned value
+                            } else {
+                                Err(Error::EvalError(
+                                    "'def' first argument must be a symbol".to_string(),
+                                ))
+                            }
+                        }
+                        "+" => {
+                            let mut sum = 0;
+                            for arg_node in args {
+                                let val = eval(arg_node, context)?;
+                                match val {
+                                    Value::Number(n) => sum += n,
+                                    // Add type error handling if other Value variants exist
+                                     _ => return Err(Error::EvalError("'+' requires number arguments".to_string())),
+                                }
+                            }
+                            Ok(Value::Number(sum))
+                        }
+                        "*" => {
+                            let mut product = 1;
+                            for arg_node in args {
+                                let val = eval(arg_node, context)?;
+                                match val {
+                                    Value::Number(n) => product *= n,
+                                     // Add type error handling if other Value variants exist
+                                    _ => return Err(Error::EvalError("'*' requires number arguments".to_string())),
+                                }
+                            }
+                            Ok(Value::Number(product))
+                        }
+                        _ => Err(Error::EvalError(format!("Unknown operator or function: {}", op))),
+                    }
                 }
-            },
-        },
-        Expr {
-            path: vec!["fetch".into(), "fact".into()],
-            eval: |ctx| {
-                if let Value::Str(json_str) = &ctx["fetch/res"] {
-                    let parsed = json_parse(json_str);
-                    let fact = parsed["fact"].as_str().unwrap_or("missing").to_string();
-                    Value::Str(fact)
-                } else {
-                    panic!("Expected string for res")
-                }
-            },
-        },
-    ]
+                // Allow evaluating lists where the head evaluates to a function later?
+                // For now, require a symbol.
+                 _ => Err(Error::EvalError(
+                     "Operator must be a symbol".to_string(),
+                 )),
+            }
+        }
+    }
 }
 
 // === MAIN ===
 
-fn main() {
-    let exprs = garden_program();
-    let mut context: HashMap<String, Value> = HashMap::new();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read the expression file
+    let file_path = "examples/one.expr"; // Specify the input file
+    let input = fs::read_to_string(file_path)?;
 
-    for expr in exprs {
-        let key = expr.path.join("/");
-        let val = (expr.eval)(&context);
-        println!("{:<20} = {:?}", key, &val);
-        context.insert(key, val);
+    // Parse the input string
+    let ast_nodes = parse(&input)?;
+
+    // Create the evaluation context
+    let mut context: HashMap<String, Value> = HashMap::new();
+    let mut last_result: Option<Value> = None;
+
+    // Evaluate each top-level expression
+    for node in ast_nodes {
+        match eval(&node, &mut context) {
+            Ok(value) => {
+                // Optional: Print intermediate results for debugging
+                // println!("Evaluating: {:?} -> Result: {:?}", node, value);
+                last_result = Some(value);
+            }
+            Err(e) => {
+                eprintln!("Evaluation Error: {}", e); // Use Display impl for Error
+                return Err(Box::new(e)); // Stop on error
+            }
+        }
     }
 
-    // Serialize to .value file
-    let pretty = PrettyConfig::new().enumerate_arrays(true).struct_names(true);
-    let ron_data = to_string_pretty(&context, pretty).unwrap();
-    fs::write("values.ron", ron_data).expect("Failed to write .value file");
+    // Print the final result (result of the last expression)
+    if let Some(result) = last_result {
+        println!("Final Result: {:?}", result);
+    } else {
+        println!("No expressions were evaluated or the file was empty.");
+    }
+
+    // Removed old logic using garden_program, expr.path, expr.eval
+    // Removed RON serialization logic
+
+    Ok(()) // Indicate successful execution
 }
 
