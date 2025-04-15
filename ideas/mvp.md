@@ -84,33 +84,9 @@ They see **live evaluated values** and **expression paths** in a **Tauri UI**, u
 
 ---
 
-## 🔁 Summary MVP Loop
-
-```mermaid
-flowchart TD
-  A[Developer edits .expr file] --> B[Tree-sitter parses file]
-  B --> C[Interpreter evaluates expressions]
-  C --> D[.value cache updated]
-  D --> E[Tauri UI reads cache + AST]
-  E --> F[Displays: paths + values + logs]
-  F --> A
-```
-
----
-
 ## ✨ What You’ll Get in the MVP
 
 - Reactive, file-based development.
 - Every expression has a **live value** and **stable identity**.
 - You can explore your code **like a data tree**, not a static script.
 - It’s tangible, introspectable, and already more powerful than a REPL.
-
----
-
-Would you like scaffolding code for:
-- the file watcher?
-- interpreter starter?
-- Tree-sitter config?
-- Tauri UI tree renderer?
-
-Just say the word, and we can start growing 🌿
