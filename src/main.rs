@@ -167,9 +167,7 @@ fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Er
             let op_node = &list[0];
             let args = &list[1..];
 
-            let op_val = eval(op_node, context)?;
-
-            if let Value::Symbol(op) = op_val {
+            if let ExprAst::Symbol(op) = op_node {
                 match op.as_str() {
                     "def" => {
                         if args.len() != 2 {
@@ -258,9 +256,9 @@ fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Er
                         let json_arg = eval(&args[0], context)?;
                         let key_arg = eval(&args[1], context)?;
 
-                        match (json_arg, key_arg) {
+                        match (&json_arg, &key_arg) {
                             (Value::Json(json), Value::String(key)) => {
-                                match json.get(&key) {
+                                match json.get(key) {
                                     Some(v) => convert_json_value(v.clone()),
                                     None => Err(Error::EvalError(format!(
                                         "Key '{}' not found in JSON object",
@@ -268,10 +266,10 @@ fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Er
                                     ))),
                                 }
                             }
-                            _ => Err(Error::EvalError(
-                                "'get' expects (json, string) arguments, got ({:?}, {:?})".into(),
-                                json_arg, key_arg
-                            )),
+                            _ => Err(Error::EvalError(format!(
+                                "'get' expects (json, string) arguments, got ({:?}, {:?})",
+                                &json_arg, &key_arg
+                            ))),
                         }
                     }
                     _ => Err(Error::EvalError(format!(
@@ -281,8 +279,8 @@ fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Er
                 }
             } else {
                 Err(Error::EvalError(format!(
-                    "List head must evaluate to a function/operator symbol, got: {:?}",
-                    op_val
+                    "List head must be a function/operator symbol, got: {:?}",
+                    op_node
                 )))
             }
         }
