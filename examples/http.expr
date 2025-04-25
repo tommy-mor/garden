@@ -2,3 +2,4 @@
     (def raw (http.get url))
     (def json (json.parse raw))
     (def fact (get json "fact"))
+    (def fact_upper (str.upper fact))

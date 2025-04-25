@@ -1,13 +1,11 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::{collections::HashMap, fs, path::Path, iter::Peekable, str::Chars};
 use serde::{Serialize, Deserialize};
 use serde_json::Value as JsonValue;
-use ron::ser::to_string_pretty;
-use ron::ser::PrettyConfig;
-use std::iter::Peekable;
-use std::str::Chars;
+use indexmap::IndexMap;
 use reqwest;
+
+// Declare the TUI module
+mod tui;
 
 // === TYPES ===
 
@@ -20,7 +18,7 @@ enum ExprAst {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Value {
+pub enum Value {
     Number(i64),
     String(String),
     Json(JsonValue),
@@ -149,7 +147,7 @@ fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
 }
 
 // === Evaluator ===
-fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Error> {
+fn eval(ast: &ExprAst, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
     match ast {
         ExprAst::Symbol(s) => context
             .get(s)
@@ -272,6 +270,21 @@ fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Er
                             ))),
                         }
                     }
+                    "str.upper" => {
+                        if args.len() != 1 {
+                            return Err(Error::EvalError(
+                                "'str.upper' expects 1 argument (string)".into(),
+                            ));
+                        }
+                        match eval(&args[0], context)? {
+                            Value::String(s) => {
+                                Ok(Value::String(s.to_uppercase()))
+                            }
+                            _ => Err(Error::EvalError(
+                                "'str.upper' expects a string argument".into(),
+                            )),
+                        }
+                    }
                     _ => Err(Error::EvalError(format!(
                         "Unknown operator or function symbol: {}",
                         op
@@ -290,54 +303,11 @@ fn eval(ast: &ExprAst, context: &mut HashMap<String, Value>) -> Result<Value, Er
 // === MAIN ===
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = "examples/http.expr";
-    println!("Reading and evaluating: {}", file_path);
-    let input = fs::read_to_string(file_path)?;
+    // Define the file to watch (can be made configurable later)
+    let file_to_watch = Path::new("examples/http.expr");
 
-    let ast_nodes = parse(&input)?;
-    println!("Parsed AST: {:?}", ast_nodes);
-
-    let mut context: HashMap<String, Value> = HashMap::new();
-    let mut last_result: Option<Value> = None;
-
-    println!("\n--- Evaluation ---");
-    for node in ast_nodes {
-        match eval(&node, &mut context) {
-            Ok(value) => {
-                if let ExprAst::List(list) = &node {
-                   if !list.is_empty() {
-                       if let ExprAst::Symbol(op) = &list[0] {
-                           if op == "def" && list.len() == 3 {
-                               if let ExprAst::Symbol(var) = &list[1] {
-                                   println!("Defined: {:<10} = {:?}", var, value);
-                               }
-                           }
-                       }
-                   }
-                }
-                last_result = Some(value);
-            }
-            Err(e) => {
-                eprintln!("Evaluation Error: {}", e);
-                println!("\n--- Context at Error ---");
-                for (key, val) in &context {
-                    println!("{:<10} = {:?}", key, val);
-                }
-                return Err(Box::new(e));
-            }
-        }
-    }
-
-    println!("\n--- Final Context ---");
-    for (key, val) in &context {
-        println!("{:<10} = {:?}", key, val);
-    }
-
-    if let Some(result) = last_result {
-         println!("\nFinal Result (last expression): {:?}", result);
-    } else {
-        println!("\nNo expressions were evaluated or the file was empty.");
-    }
+    // Run the TUI
+    tui::run(file_to_watch)?;
 
     Ok(())
 }
@@ -381,6 +351,21 @@ impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         Error::JsonError(err.to_string())
     }
+}
+
+pub fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Option<Value>), Box<dyn std::error::Error>> {
+    let input = fs::read_to_string(file_path)?;
+    let ast_nodes = parse(&input)?;
+
+    let mut context: IndexMap<String, Value> = IndexMap::new();
+    let mut last_result: Option<Value> = None;
+
+    for node in ast_nodes {
+        let value = eval(&node, &mut context)?;
+        last_result = Some(value);
+    }
+
+    Ok((context, last_result))
 }
 
 
