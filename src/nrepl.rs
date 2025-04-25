@@ -36,6 +36,8 @@ struct NreplMsg {
 struct NreplResponse<'a> {
     id: Option<&'a str>,
     session: Option<&'a str>,
+    #[serde(rename = "new-session", skip_serializing_if = "Option::is_none")]
+    new_session: Option<&'a str>, // Field expected by clients for clone op
     status: Vec<&'a str>, // e.g., ["done"] or ["error", "eval-error"]
     value: Option<String>, // Value needs serialization - simple String for now
     ex: Option<String>, // Exception/Error message
@@ -167,7 +169,8 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
 
                             let response = NreplResponse {
                                 id: msg.id.as_deref(),
-                                session: Some(&new_session_id),
+                                session: None, // Not used in clone response
+                                new_session: Some(&new_session_id), // Use the new field
                                 status: vec!["done"],
                                 value: None,
                                 ex: None,
@@ -206,6 +209,7 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
                                         let response = NreplResponse {
                                             id: msg.id.as_deref(),
                                             session: Some(&session_id),
+                                            new_session: None, // Not used in eval response
                                             status: vec!["done"],
                                             value: Some(format!("{:?}", value)),
                                             ex: None,
@@ -218,6 +222,7 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
                                         let response = NreplResponse {
                                             id: msg.id.as_deref(),
                                             session: Some(&session_id),
+                                            new_session: None,
                                             status: vec!["error", "eval-error"],
                                             value: None,
                                             ex: Some(e.to_string()),
@@ -237,6 +242,7 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
                              let description = NreplResponse {
                                  id: msg.id.as_deref(),
                                  session: session_id_for_op.map(|s| s.as_str()),
+                                 new_session: None,
                                  status: vec!["done"],
                                  value: Some(format!("{{\"ops\":{{\"eval\":{{}},\"clone\":{{}},\"describe\":{{}}}},\"versions\":{{\"garden\":\"{}\",\"nrepl\":\"{}\"}}}}",
                                      env!("CARGO_PKG_VERSION"), "0.x (basic)")),
@@ -252,6 +258,7 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
                             let response = NreplResponse {
                                 id: msg.id.as_deref(),
                                 session: session_id_for_op.map(|s| s.as_str()),
+                                new_session: None,
                                 status: vec!["error", "unknown-op"],
                                 value: None,
                                 ex: Some(format!("Unknown op: {}", msg.op)),
