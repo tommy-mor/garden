@@ -308,14 +308,15 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
 
 // === MAIN ===
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Define the file to watch (can be made configurable later)
-    let file_to_watch = Path::new("examples/http.expr");
-
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting Garden nREPL server...");
+    // Start the nREPL server and keep it running
+    nrepl::start_server().await?;
     Ok(())
 }
 
-fn convert_json_value(json_val: JsonValue) -> Result<Value, Error> {
+pub fn convert_json_value(json_val: JsonValue) -> Result<Value, Error> {
     match json_val {
         JsonValue::String(s) => Ok(Value::String(s)),
         JsonValue::Number(n) => {
