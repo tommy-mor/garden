@@ -4,9 +4,6 @@ use serde_json::Value as JsonValue;
 use indexmap::IndexMap;
 use reqwest;
 
-// Declare the TUI module
-mod tui;
-
 // === TYPES ===
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,9 +302,6 @@ fn eval(ast: &ExprAst, context: &mut IndexMap<String, Value>) -> Result<Value, E
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Define the file to watch (can be made configurable later)
     let file_to_watch = Path::new("examples/http.expr");
-
-    // Run the TUI
-    tui::run(file_to_watch)?;
 
     Ok(())
 }
