@@ -11,14 +11,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph}, // Start with basic widgets
     Frame, Terminal,
 };
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, event::{ModifyKind, EventKind}, Config};
 use std::{
     io::{self, Stdout},
     path::{Path, PathBuf},
-    sync::mpsc, // Use std::sync::mpsc for channels
-    thread,
-    time::Duration,
-    fs, // Import fs for canonicalize
 };
 
 // Import necessary items from main.rs (adjust path if needed)
@@ -63,21 +58,8 @@ impl App {
     }
 }
 
-/// Enum to represent messages sent from the watcher thread
-#[derive(Debug)]
-enum WatcherMessage {
-    FileModified,
-}
-
 /// Main function to run the TUI application
 pub fn run(file_to_watch: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // --- Resolve Absolute Path --- 
-    // Canonicalize the path to ensure it's absolute for reliable comparison
-    let absolute_path = fs::canonicalize(file_to_watch)
-        .map_err(|e| format!("Failed to find or canonicalize watched file '{}': {}", file_to_watch.display(), e))?;
-    println!("DEBUG: Watching absolute path: {}", absolute_path.display()); // Debug
-    // --- End Resolve Path --- 
-
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -85,51 +67,12 @@ pub fn run(file_to_watch: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app state using the absolute path
-    let mut app = App::new(absolute_path.clone());
+    // Create app state using the provided path directly
+    let mut app = App::new(file_to_watch.to_path_buf());
     app.initial_evaluate(); // Perform the first evaluation
 
-    // --- File Watcher Setup ---
-    let (tx, rx) = mpsc::channel::<WatcherMessage>();
-    // Use the absolute path for the watcher setup as well
-    let watched_path = absolute_path; // No need to clone here if app took ownership via clone()
-
-    let watcher_thread = thread::spawn(move || {
-        let tx = tx.clone();
-        let path_for_closure = watched_path.clone();
-
-        let mut watcher = RecommendedWatcher::new(
-            move |res: Result<notify::Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        if event.kind.is_modify() {
-                            if let EventKind::Modify(data) = event.kind {
-                                if let ModifyKind::Data(data) = data {
-                                    let _ = tx.send(WatcherMessage::FileModified);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("Watcher Error: {:?}", e),
-                }
-            },
-            Config::default(),
-        ).expect("Failed to create file watcher");
-
-        // Use the (absolute) watched_path here
-        watcher.watch(&watched_path, RecursiveMode::NonRecursive)
-             .expect("Failed to start watching file directly");
-        eprintln!("DEBUG: Watching file directly: {}", watched_path.display());
-
-        // Keep the watcher thread alive...
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
-    // --- End File Watcher Setup ---
-
-    // Pass the receiver to the app loop
-    let res = run_app(&mut terminal, app, rx);
+    // Pass the receiver to the app loop - Removed receiver
+    let res = run_app(&mut terminal, app); // Removed rx argument
 
     // Restore terminal
     disable_raw_mode()?;
@@ -139,9 +82,6 @@ pub fn run(file_to_watch: &Path) -> Result<(), Box<dyn std::error::Error>> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-
-    // Optional: Consider how to gracefully stop the watcher thread if needed
-    // watcher_thread.join()... (might require signalling mechanism)
 
     if let Err(err) = res {
         eprintln!("TUI Error: {:?}", err);
@@ -155,28 +95,16 @@ pub fn run(file_to_watch: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
-    watcher_rx: mpsc::Receiver<WatcherMessage>, // Add receiver argument
+    // Removed watcher_rx argument
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
         // --- Event Handling ---
 
-        // 1. Check for file watcher messages (non-blocking)
-        match watcher_rx.try_recv() {
-            Ok(WatcherMessage::FileModified) => {
-                app.re_evaluate(); // Re-run evaluation logic
-            }
-            Err(mpsc::TryRecvError::Empty) => {},
-            Err(mpsc::TryRecvError::Disconnected) => {
-                // Watcher thread likely panicked, set an error state?
-                app.last_error = Some("File watcher disconnected!".to_string());
-                // Consider quitting or logging
-            }
-        }
-
-        // 2. Check for keyboard input (with timeout)
-        if crossterm::event::poll(Duration::from_millis(100))? { // Shorter timeout
+        // Check for keyboard input (with timeout)
+        // Increased timeout slightly as we poll less often now
+        if crossterm::event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => app.should_quit = true,
@@ -210,8 +138,8 @@ fn ui(f: &mut Frame, app: &App) {
         )
         .split(f.size());
 
-    // Top: File Info
-    let file_text = format!("Watching: {}", app.file_path.display());
+    // Top: File Info - Changed "Watching" to "Evaluating"
+    let file_text = format!("Evaluating: {}", app.file_path.display());
     let file_paragraph = Paragraph::new(file_text).block(Block::default().borders(Borders::ALL).title("File"));
     f.render_widget(file_paragraph, chunks[0]);
 
@@ -235,7 +163,7 @@ fn ui(f: &mut Frame, app: &App) {
     // Bottom: Status/Error Bar
     let status_text = match &app.last_error {
         Some(err) => err.clone(),
-        None => "OK | Press 'q' to quit".to_string(),
+        None => "OK | Press 'q' to quit, 'r' to reload".to_string(), // Updated help text
     };
      let status_style = match &app.last_error {
          Some(_) => Style::default().fg(Color::Red),
