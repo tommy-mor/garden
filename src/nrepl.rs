@@ -204,7 +204,7 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
 
                             if let Some(ctx_arc) = context_arc {
                                 let mut context_guard = ctx_arc.lock().await;
-                                match evaluate_form(code, &mut context_guard) {
+                                match evaluate_form(code, &mut context_guard).await {
                                     Ok(value) => {
                                         let response = NreplResponse {
                                             id: msg.id.as_deref(),

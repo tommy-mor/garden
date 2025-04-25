@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 use indexmap::IndexMap;
 use reqwest;
 use std::error::Error as StdError;
+use futures::future::BoxFuture;
 
 mod nrepl;
 
@@ -147,162 +148,162 @@ fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
 }
 
 // === Evaluator ===
-fn eval(ast: &ExprAst, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
-    match ast {
-        ExprAst::Symbol(s) => context
-            .get(s)
-            .cloned()
-            .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", s))),
-        ExprAst::Number(n) => Ok(Value::Number(*n)),
-        ExprAst::String(s) => Ok(Value::String(s.clone())),
-        ExprAst::List(list) => {
-            if list.is_empty() {
-                return Err(Error::EvalError(
-                    "Cannot evaluate empty list".to_string(),
-                ));
-            }
+pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> BoxFuture<'a, Result<Value, Error>> {
+    Box::pin(async move {
+        match ast {
+            ExprAst::Symbol(s) => Ok(context
+                .get(s)
+                .cloned()
+                .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", s)))?),
+            ExprAst::Number(n) => Ok(Value::Number(*n)),
+            ExprAst::String(s) => Ok(Value::String(s.clone())),
+            ExprAst::List(list) => {
+                if list.is_empty() {
+                    return Err(Error::EvalError("Cannot evaluate empty list".to_string()));
+                }
 
-            let op_node = &list[0];
-            let args = &list[1..];
+                let op_node = &list[0];
+                let args = &list[1..];
 
-            if let ExprAst::Symbol(op) = op_node {
-                match op.as_str() {
-                    "def" => {
-                        if args.len() != 2 {
-                            return Err(Error::EvalError(format!(
-                                "'def' expects 2 arguments, got {}",
-                                args.len()
-                            )));
-                        }
-                        let var_name_node = &args[0];
-                        let value_node = &args[1];
+                if let ExprAst::Symbol(op) = op_node {
+                    match op.as_str() {
+                        "def" => {
+                            if args.len() != 2 {
+                                return Err(Error::EvalError(format!(
+                                    "'def' expects 2 arguments, got {}",
+                                    args.len()
+                                )));
+                            }
+                            let var_name_node = &args[0];
+                            let value_node = &args[1];
 
-                        if let ExprAst::Symbol(var_name) = var_name_node {
-                            let value = eval(value_node, context)?;
-                            context.insert(var_name.clone(), value.clone());
-                            Ok(value)
-                        } else {
-                            Err(Error::EvalError(
-                                "'def' first argument must be a symbol".to_string(),
-                            ))
-                        }
-                    }
-                    "+" => {
-                        let mut sum = 0;
-                        for arg_node in args {
-                            let val = eval(arg_node, context)?;
-                            match val {
-                                Value::Number(n) => sum += n,
-                                _ => return Err(Error::EvalError(
-                                    "'+' requires number arguments".to_string(),
-                                )),
+                            if let ExprAst::Symbol(var_name) = var_name_node {
+                                let value = eval(value_node, context).await?;
+                                context.insert(var_name.clone(), value.clone());
+                                Ok(value)
+                            } else {
+                                Err(Error::EvalError(
+                                    "'def' first argument must be a symbol".to_string(),
+                                ))
                             }
                         }
-                        Ok(Value::Number(sum))
-                    }
-                    "*" => {
-                        let mut product = 1;
-                        for arg_node in args {
-                            let val = eval(arg_node, context)?;
-                            match val {
-                                Value::Number(n) => product *= n,
-                                _ => return Err(Error::EvalError(
-                                    "'*' requires number arguments".to_string(),
-                                )),
-                            }
-                        }
-                        Ok(Value::Number(product))
-                    }
-                    "http.get" => {
-                        if args.len() != 1 {
-                            return Err(Error::EvalError(
-                                "'http.get' expects 1 argument (url)".into(),
-                            ));
-                        }
-                        match eval(&args[0], context)? {
-                            Value::String(url) => {
-                                let body = reqwest::blocking::get(&url)?.text()?;
-                                Ok(Value::String(body))
-                            }
-                            _ => Err(Error::EvalError(
-                                "'http.get' expects a string argument".into(),
-                            )),
-                        }
-                    }
-                    "json.parse" => {
-                        if args.len() != 1 {
-                            return Err(Error::EvalError(
-                                "'json.parse' expects 1 argument (string)".into(),
-                            ));
-                        }
-                        match eval(&args[0], context)? {
-                            Value::String(s) => {
-                                let json_data: JsonValue = serde_json::from_str(&s)?;
-                                Ok(Value::Json(json_data))
-                            }
-                            _ => Err(Error::EvalError(
-                                "'json.parse' expects a string argument".into(),
-                            )),
-                        }
-                    }
-                    "get" => {
-                        if args.len() != 2 {
-                            return Err(Error::EvalError(
-                                "'get' expects 2 arguments (json, key)".into(),
-                            ));
-                        }
-                        let json_arg = eval(&args[0], context)?;
-                        let key_arg = eval(&args[1], context)?;
-
-                        match (&json_arg, &key_arg) {
-                            (Value::Json(json), Value::String(key)) => {
-                                match json.get(key) {
-                                    Some(v) => convert_json_value(v.clone()),
-                                    None => Err(Error::EvalError(format!(
-                                        "Key '{}' not found in JSON object",
-                                        key
-                                    ))),
+                        "+" => {
+                            let mut sum = 0;
+                            for arg_node in args {
+                                let val = eval(arg_node, context).await?;
+                                match val {
+                                    Value::Number(n) => sum += n,
+                                    _ => return Err(Error::EvalError(
+                                        "'+' requires number arguments".to_string(),
+                                    )),
                                 }
                             }
-                            _ => Err(Error::EvalError(format!(
-                                "'get' expects (json, string) arguments, got ({:?}, {:?})",
-                                &json_arg, &key_arg
-                            ))),
+                            Ok(Value::Number(sum))
                         }
-                    }
-                    "str.upper" => {
-                        if args.len() != 1 {
-                            return Err(Error::EvalError(
-                                "'str.upper' expects 1 argument (string)".into(),
-                            ));
-                        }
-                        match eval(&args[0], context)? {
-                            Value::String(s) => {
-                                Ok(Value::String(s.to_uppercase()))
+                        "*" => {
+                            let mut product = 1;
+                            for arg_node in args {
+                                let val = eval(arg_node, context).await?;
+                                match val {
+                                    Value::Number(n) => product *= n,
+                                    _ => return Err(Error::EvalError(
+                                        "'*' requires number arguments".to_string(),
+                                    )),
+                                }
                             }
-                            _ => Err(Error::EvalError(
-                                "'str.upper' expects a string argument".into(),
-                            )),
+                            Ok(Value::Number(product))
+                        }
+                        "http.get" => {
+                            if args.len() != 1 {
+                                return Err(Error::EvalError(
+                                    "'http.get' expects 1 argument (url)".into(),
+                                ));
+                            }
+                            match eval(&args[0], context).await? {
+                                Value::String(url) => {
+                                    let body = reqwest::get(&url).await?.text().await?;
+                                    Ok(Value::String(body))
+                                }
+                                _ => Err(Error::EvalError(
+                                    "'http.get' expects a string argument".into(),
+                                )),
+                            }
+                        }
+                        "json.parse" => {
+                            if args.len() != 1 {
+                                return Err(Error::EvalError(
+                                    "'json.parse' expects 1 argument (string)".into(),
+                                ));
+                            }
+                            match eval(&args[0], context).await? {
+                                Value::String(s) => {
+                                    let json_data: JsonValue = serde_json::from_str(&s)?;
+                                    Ok(Value::Json(json_data))
+                                }
+                                _ => Err(Error::EvalError(
+                                    "'json.parse' expects a string argument".into(),
+                                )),
+                            }
+                        }
+                        "get" => {
+                            if args.len() != 2 {
+                                return Err(Error::EvalError(
+                                    "'get' expects 2 arguments (json, key)".into(),
+                                ));
+                            }
+                            let json_arg = eval(&args[0], context).await?;
+                            let key_arg = eval(&args[1], context).await?;
+
+                            match (&json_arg, &key_arg) {
+                                (Value::Json(json), Value::String(key)) => {
+                                    match json.get(key) {
+                                        Some(v) => convert_json_value(v.clone()),
+                                        None => Err(Error::EvalError(format!(
+                                            "Key '{}' not found in JSON object",
+                                            key
+                                        ))),
+                                    }
+                                }
+                                _ => Err(Error::EvalError(format!(
+                                    "'get' expects (json, string) arguments, got ({:?}, {:?})",
+                                    &json_arg, &key_arg
+                                ))),
+                            }
+                        }
+                        "str.upper" => {
+                            if args.len() != 1 {
+                                return Err(Error::EvalError(
+                                    "'str.upper' expects 1 argument (string)".into(),
+                                ));
+                            }
+                            match eval(&args[0], context).await? {
+                                Value::String(s) => {
+                                    Ok(Value::String(s.to_uppercase()))
+                                }
+                                _ => Err(Error::EvalError(
+                                    "'str.upper' expects a string argument".into(),
+                                )),
+                            }
+                        }
+                        _ => {
+                            // Leniently handle unknown ops potentially sent by clients.
+                            // Instead of erroring, return a neutral value like "nil".
+                            // This might allow clients like CIDER to proceed past
+                            // their Clojure-specific setup code, though the op is ignored.
+                            // Optionally log a warning here:
+                            // eprintln!("Warning: Unknown function symbol '{}' encountered, returning nil.", op);
+                            Ok(Value::String("nil".to_string()))
                         }
                     }
-                    _ => {
-                        // Leniently handle unknown ops potentially sent by clients.
-                        // Instead of erroring, return a neutral value like "nil".
-                        // This might allow clients like CIDER to proceed past
-                        // their Clojure-specific setup code, though the op is ignored.
-                        // Optionally log a warning here:
-                        // eprintln!("Warning: Unknown function symbol '{}' encountered, returning nil.", op);
-                        Ok(Value::String("nil".to_string()))
-                    }
+                } else {
+                    Err(Error::EvalError(format!(
+                        "List head must be a function/operator symbol, got: {:?}",
+                        op_node
+                    )))
                 }
-            } else {
-                Err(Error::EvalError(format!(
-                    "List head must be a function/operator symbol, got: {:?}",
-                    op_node
-                )))
             }
         }
-    }
+    })
 }
 
 // === MAIN ===
@@ -355,7 +356,7 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-pub fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Option<Value>), Box<dyn std::error::Error>> {
+pub async fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Option<Value>), Box<dyn std::error::Error>> {
     let input = fs::read_to_string(file_path)?;
     let ast_nodes = parse(&input)?;
 
@@ -363,11 +364,23 @@ pub fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Optio
     let mut last_result: Option<Value> = None;
 
     for node in ast_nodes {
-        let value = eval(&node, &mut context)?;
+        let value = eval(&node, &mut context).await?;
         last_result = Some(value);
     }
 
     Ok((context, last_result))
+}
+
+pub async fn evaluate_form(code: &str, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
+    let ast_nodes = parse(code)?;
+    let mut last_result: Option<Value> = None;
+
+    for node in ast_nodes {
+        let value = eval(&node, context).await?;
+        last_result = Some(value);
+    }
+
+    last_result.ok_or_else(|| Error::EvalError("No result found".to_string()))
 }
 
 
