@@ -3,11 +3,14 @@ use serde::{Serialize, Deserialize};
 use serde_json::Value as JsonValue;
 use indexmap::IndexMap;
 use reqwest;
+use std::error::Error as StdError;
+
+mod nrepl;
 
 // === TYPES ===
 
 #[derive(Debug, Clone, PartialEq)]
-enum ExprAst {
+pub enum ExprAst {
     Symbol(String),
     Number(i64),
     List(Vec<ExprAst>),
@@ -22,7 +25,7 @@ pub enum Value {
 }
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     ParseError(String),
     EvalError(String),
     HttpError(String),
@@ -40,11 +43,11 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl StdError for Error {}
 
 // === Parser ===
 
-fn parse_expr(tokens: &mut Peekable<Chars>) -> Result<ExprAst, Error> {
+pub fn parse_expr(tokens: &mut Peekable<Chars>) -> Result<ExprAst, Error> {
     while tokens.peek().map_or(false, |c| c.is_whitespace()) {
         tokens.next();
     }
@@ -126,7 +129,7 @@ fn parse_expr(tokens: &mut Peekable<Chars>) -> Result<ExprAst, Error> {
     }
 }
 
-fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
+pub fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
     let mut tokens = input.chars().peekable();
     let mut ast_nodes = Vec::new();
 
@@ -144,7 +147,7 @@ fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
 }
 
 // === Evaluator ===
-fn eval(ast: &ExprAst, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
+pub fn eval(ast: &ExprAst, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
     match ast {
         ExprAst::Symbol(s) => context
             .get(s)
@@ -297,16 +300,41 @@ fn eval(ast: &ExprAst, context: &mut IndexMap<String, Value>) -> Result<Value, E
     }
 }
 
-// === MAIN ===
+// === Helper for nREPL ===
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Define the file to watch (can be made configurable later)
-    let file_to_watch = Path::new("examples/http.expr");
+// Function to evaluate a single string form within a given context
+pub fn evaluate_form(code: &str, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
+    let ast_nodes = parse(code)?; // Use the existing parser
+    let mut last_result: Option<Value> = None;
 
+    if ast_nodes.is_empty() {
+        // nREPL often sends empty strings or comments, return something neutral
+        // Or maybe a specific Value type like Value::Nil if you add one.
+        return Ok(Value::String("".to_string())); // Or handle differently
+    }
+
+    for node in ast_nodes {
+        // Evaluate each top-level form in the string
+        let value = eval(&node, context)?;
+        last_result = Some(value);
+    }
+
+    // Return the result of the last form evaluated
+    last_result.ok_or_else(|| Error::EvalError("No expression evaluated".to_string()))
+}
+
+// === Main Entry Point ===
+
+// #[tokio::main] ensures the Tokio runtime is started
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting Garden nREPL server...");
+    // Start the nREPL server and keep it running
+    nrepl::start_server().await?;
     Ok(())
 }
 
-fn convert_json_value(json_val: JsonValue) -> Result<Value, Error> {
+pub fn convert_json_value(json_val: JsonValue) -> Result<Value, Error> {
     match json_val {
         JsonValue::String(s) => Ok(Value::String(s)),
         JsonValue::Number(n) => {
@@ -347,6 +375,8 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+// This function might still be useful for loading files via nREPL later,
+// but it's no longer the primary evaluation mechanism. Keep it for now.
 pub fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Option<Value>), Box<dyn std::error::Error>> {
     let input = fs::read_to_string(file_path)?;
     let ast_nodes = parse(&input)?;
