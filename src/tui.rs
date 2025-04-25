@@ -11,13 +11,14 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph}, // Start with basic widgets
     Frame, Terminal,
 };
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind, Config};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, event::{ModifyKind, EventKind}, Config};
 use std::{
     io::{self, Stdout},
     path::{Path, PathBuf},
     sync::mpsc, // Use std::sync::mpsc for channels
     thread,
     time::Duration,
+    fs, // Import fs for canonicalize
 };
 
 // Import necessary items from main.rs (adjust path if needed)
@@ -70,6 +71,13 @@ enum WatcherMessage {
 
 /// Main function to run the TUI application
 pub fn run(file_to_watch: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // --- Resolve Absolute Path --- 
+    // Canonicalize the path to ensure it's absolute for reliable comparison
+    let absolute_path = fs::canonicalize(file_to_watch)
+        .map_err(|e| format!("Failed to find or canonicalize watched file '{}': {}", file_to_watch.display(), e))?;
+    println!("DEBUG: Watching absolute path: {}", absolute_path.display()); // Debug
+    // --- End Resolve Path --- 
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -77,56 +85,46 @@ pub fn run(file_to_watch: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app state
-    let mut app = App::new(file_to_watch.to_path_buf());
+    // Create app state using the absolute path
+    let mut app = App::new(absolute_path.clone());
     app.initial_evaluate(); // Perform the first evaluation
 
     // --- File Watcher Setup ---
-    let (tx, rx) = mpsc::channel::<WatcherMessage>(); // Channel for watcher -> TUI
-    let watched_path = file_to_watch.to_path_buf();
+    let (tx, rx) = mpsc::channel::<WatcherMessage>();
+    // Use the absolute path for the watcher setup as well
+    let watched_path = absolute_path; // No need to clone here if app took ownership via clone()
 
     let watcher_thread = thread::spawn(move || {
-        // Clone the sender for the closure
         let tx = tx.clone();
+        let path_for_closure = watched_path.clone();
 
-        // Create a file system watcher
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<notify::Event, notify::Error>| {
                 match res {
                     Ok(event) => {
-                        // We only care about content modifications
-                        if event.kind.is_modify() || event.kind.is_create() {
-                            // It's often ModifyKind::Any, especially on save
-                             // Send a message without blocking, ignore errors if receiver is dropped
-                             let _ = tx.send(WatcherMessage::FileModified);
+                        if event.kind.is_modify() {
+                            if let EventKind::Modify(data) = event.kind {
+                                if let ModifyKind::Data(data) = data {
+                                    let _ = tx.send(WatcherMessage::FileModified);
+                                }
+                            }
                         }
                     }
-                    Err(e) => eprintln!("Watcher Error: {:?}", e), // Log errors from watcher
+                    Err(e) => eprintln!("Watcher Error: {:?}", e),
                 }
             },
             Config::default(),
         ).expect("Failed to create file watcher");
 
-        // Watch the specific file
-        // Watch parent directory for more robust file saving detection (atomic writes)
-        if let Some(parent) = watched_path.parent() {
-             watcher.watch(parent, RecursiveMode::NonRecursive)
-                 .expect("Failed to start watching file's parent directory");
-             eprintln!("DEBUG: Watching directory: {}", parent.display()); // Debug message
-         } else {
-             eprintln!("Error: Cannot watch parent directory of {}", watched_path.display());
-             // Handle error appropriately, maybe watch the file directly as fallback
-             watcher.watch(&watched_path, RecursiveMode::NonRecursive)
-                  .expect("Failed to start watching file directly");
-             eprintln!("DEBUG: Watching file directly: {}", watched_path.display()); // Debug message
-         }
+        // Use the (absolute) watched_path here
+        watcher.watch(&watched_path, RecursiveMode::NonRecursive)
+             .expect("Failed to start watching file directly");
+        eprintln!("DEBUG: Watching file directly: {}", watched_path.display());
 
-        // Keep the watcher thread alive
-        // In a real app, you might want a way to signal this thread to stop.
-        // For this example, it runs until the main app exits.
-         loop {
-             thread::sleep(Duration::from_secs(1));
-         }
+        // Keep the watcher thread alive...
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
     });
     // --- End File Watcher Setup ---
 
