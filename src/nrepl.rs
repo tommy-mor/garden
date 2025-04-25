@@ -1,21 +1,23 @@
 use crate::{evaluate_form, Value, Error}; // Assuming evaluate_form exists in main.rs or lib.rs
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_bencode::{de, ser}; // Corrected import for bencode ser/de
+use serde_bencode::{de, ser, value::Value as BencodeValue}; // Import BencodeValue for length heuristic
 use serde_bytes::ByteBuf;
 use std::{
     collections::HashMap,
     fs::File,
-    io::{self, Write},
+    io::{self, Write, ErrorKind},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex}, // Using std Mutex for simplicity, could switch to tokio::sync::Mutex
+    sync::Arc, // Use std Arc (tokio re-exports it)
+    error::Error as StdError // Import the standard Error trait
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufReader}, // Import AsyncReadExt for read_buf
     net::{TcpListener, TcpStream},
-    sync::mpsc, // For potential inter-task communication if needed later
+    sync::{mpsc, Mutex}, // Use Tokio's Mutex
 };
+use bytes::{BytesMut, Buf}; // Added for buffer management
 
 // Placeholder for nREPL message structure (adjust based on actual protocol needs)
 #[derive(Serialize, Deserialize, Debug)]
@@ -42,9 +44,9 @@ struct NreplResponse<'a> {
 
 
 // Represents the state for each connected nREPL session
-type SessionContext = Arc<Mutex<IndexMap<String, Value>>>;
+type SessionContext = Arc<Mutex<IndexMap<String, Value>>>; // Use Tokio's Mutex, std Arc
 // Stores all active sessions
-type SessionStore = Arc<Mutex<HashMap<String, SessionContext>>>;
+type SessionStore = Arc<Mutex<HashMap<String, SessionContext>>>; // Use Tokio's Mutex, std Arc
 
 
 pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +57,7 @@ pub async fn start_server() -> Result<(), Box<dyn std::error::Error>> {
     // Write .nrepl-port file
     write_nrepl_port_file(addr)?;
 
+    // Initialize with Tokio's Arc and Mutex
     let sessions: SessionStore = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
@@ -84,7 +87,9 @@ fn write_nrepl_port_file(addr: SocketAddr) -> io::Result<()> {
 
 async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), Box<dyn std::error::Error>> {
     let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
+    let mut reader = BufReader::new(reader); // Use reader directly
+    let mut buffer = BytesMut::with_capacity(4096); // Buffer for incoming data
+
 
     // We need a way to associate this connection with a session.
     // For now, let's assume a default session per connection or manage via 'clone' op.
@@ -94,185 +99,201 @@ async fn handle_client(stream: TcpStream, sessions: SessionStore) -> Result<(), 
 
 
     loop {
-        // nREPL uses bencode. We need to read bencoded messages.
-        // Reading bencode streams isn't trivial with just BufReader lines.
-        // We'll need a more robust way to delimit and parse bencode messages.
-        // Placeholder: Read line by line (INCORRECT for bencode, just for structure)
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break, // Connection closed
-            Ok(_) => {
-                // Trim whitespace
-                let trimmed_line = line.trim();
-                if trimmed_line.is_empty() {
-                    continue;
-                }
-
-                 // !!! --- THIS IS A HUGE SIMPLIFICATION --- !!!
-                 // Actual implementation requires a bencode parser that can read from the stream.
-                 // serde_bencode::from_reader might work, but needs careful handling of message boundaries.
-                 // For now, let's pretend the line IS the bencode msg content for structure.
-                println!("Received (raw): {}", trimmed_line);
-
-                // Attempt to decode as bencode (will likely fail often with line reader)
-                let msg: NreplMsg = match de::from_str::<NreplMsg>(trimmed_line) {
-                     Ok(m) => m,
-                     Err(e) => {
-                         eprintln!("Bencode decode error: {}", e);
-                         // Send an error response? Requires knowing message ID.
-                         // Skipping proper error response for now.
-                         continue;
-                     }
-                 };
-
-                println!("Received msg: {:?}", msg);
-
-                // --- Message Handling Logic ---
-                let session_id_for_op = msg.session.as_ref().or(current_session_id.as_ref());
-
-                 match msg.op.as_str() {
-                     "clone" => {
-                        let new_session_id = uuid::Uuid::new_v4().to_string(); // Requires `uuid` crate
-                        let parent_context = session_id_for_op.and_then(|sid| sessions.lock().unwrap().get(sid).cloned());
-                        let new_context = parent_context.map_or_else(
-                             || Arc::new(Mutex::new(IndexMap::new())), // New empty context
-                             |ctx_arc| Arc::new(Mutex::new(ctx_arc.lock().unwrap().clone())) // Cloned context
-                        );
-
-                        sessions.lock().unwrap().insert(new_session_id.clone(), new_context);
-                        current_session_id = Some(new_session_id.clone()); // Set current session for this handler
-
-                        let response = NreplResponse {
-                             id: msg.id.as_deref(),
-                             session: Some(&new_session_id),
-                             status: vec!["done"],
-                             value: None,
-                             ex: None,
-                         };
-                        let resp_bytes = ser::to_bytes(&response)?;
-                        writer.write_all(&resp_bytes).await?;
-                        writer.flush().await?;
-                        println!("Sent clone response: {:?}", response);
-
-                     }
-                     "eval" => {
-                         if msg.code.is_none() {
-                             // Send error response: no code
-                             continue;
-                         }
-                         let code = msg.code.as_ref().unwrap();
-
-                         // Get or create session context
-                        let session_id = match session_id_for_op {
-                            Some(id) => id.clone(),
-                            None => {
-                                // If no session specified and none active, create one? Or error?
-                                // Let's create one implicitly for now.
-                                let new_id = uuid::Uuid::new_v4().to_string();
-                                sessions.lock().unwrap().insert(new_id.clone(), Arc::new(Mutex::new(IndexMap::new())));
-                                current_session_id = Some(new_id.clone()); // Track it for subsequent ops
-                                new_id
-                            }
-                        };
-
-                         let context_arc = sessions.lock().unwrap().get(&session_id).cloned();
-
-                         if let Some(ctx_arc) = context_arc {
-                            let mut context_guard = ctx_arc.lock().unwrap(); // Lock the context for evaluation
-                            // !!! Need evaluate_form function !!!
-                            match evaluate_form(code, &mut context_guard) {
-                                Ok(value) => {
-                                    let response = NreplResponse {
-                                        id: msg.id.as_deref(),
-                                        session: Some(&session_id),
-                                        status: vec!["done"],
-                                        value: Some(format!("{:?}", value)), // Simple debug format for now
-                                        ex: None,
-                                    };
-                                    let resp_bytes = ser::to_bytes(&response)?;
-                                    writer.write_all(&resp_bytes).await?;
-                                     println!("Sent eval response: {:?}", response);
-                                }
-                                Err(e) => {
-                                    let response = NreplResponse {
-                                        id: msg.id.as_deref(),
-                                        session: Some(&session_id),
-                                        status: vec!["error", "eval-error"],
-                                        value: None,
-                                        ex: Some(e.to_string()),
-                                    };
-                                    let resp_bytes = ser::to_bytes(&response)?;
-                                    writer.write_all(&resp_bytes).await?;
-                                    println!("Sent eval error response: {:?}", response);
-                                }
-                            }
-                         } else {
-                              // Session ID provided but not found? Internal error.
-                             eprintln!("Error: Session ID '{}' not found in store.", session_id);
-                              // Send error response
-                         }
-                     }
-                     "describe" => {
-                         // Respond with basic info about available ops, etc.
-                         // Hardcoded for now.
-                         let description = NreplResponse { // Using same struct, maybe needs dedicated one
-                             id: msg.id.as_deref(),
-                             session: session_id_for_op.map(|s| s.as_str()),
-                             status: vec!["done"],
-                             value: Some(format!("{{\"ops\":{{\"eval\":{{}},\"clone\":{{}},\"describe\":{{}}}},\"versions\":{{\"garden\":\"{}\",\"nrepl\":\"{}\"}}}}",
-                                env!("CARGO_PKG_VERSION"), "0.x (basic)")), // Provide some basic info
-                             ex: None,
-                         };
-                         let resp_bytes = ser::to_bytes(&description)?;
-                         writer.write_all(&resp_bytes).await?;
-                         println!("Sent describe response: {:?}", description);
-                     }
-                     // Handle other ops like "load-file", "interrupt", "lookup", etc.
-                     _ => {
-                         eprintln!("Unhandled op: {}", msg.op);
-                          // Send 'unknown-op' error response
-                         let response = NreplResponse {
-                             id: msg.id.as_deref(),
-                             session: session_id_for_op.map(|s| s.as_str()),
-                             status: vec!["error", "unknown-op"],
-                             value: None,
-                             ex: Some(format!("Unknown op: {}", msg.op)),
-                         };
-                         let resp_bytes = ser::to_bytes(&response)?;
-                         writer.write_all(&resp_bytes).await?;
-                         println!("Sent unknown-op response: {:?}", response);
-                     }
-                 }
-
-                 writer.flush().await?; // Ensure response is sent
-            }
-            Err(e) => {
-                // Handle read errors (e.g., connection reset)
-                eprintln!("Error reading from client: {}", e);
-                break;
+        let bytes_read = reader.read_buf(&mut buffer).await?;
+        if bytes_read == 0 {
+            // Connection closed cleanly by peer
+            if buffer.is_empty() {
+                break; // Clean exit
+            } else {
+                // Connection closed with partial message in buffer
+                eprintln!("Connection closed with partial data in buffer");
+                return Err("Connection closed unexpectedly".into());
             }
         }
-    }
 
-    // Cleanup: Remove the session associated with this connection if it was implicitly created?
-    // Or rely on client explicitly closing sessions? nREPL spec needed.
+        // Try to deserialize messages from the buffer
+        loop {
+            let buf_slice = buffer.chunk();
+            if buf_slice.is_empty() {
+                break; // No more data in buffer for now
+            }
+
+            // Attempt direct deserialization from the slice
+            match de::from_bytes::<NreplMsg>(buf_slice) {
+                Ok(msg) => {
+                    // Estimate consumed size by deserializing into a generic bencode value
+                    // This is a heuristic and might not be perfectly accurate for all bencode forms
+                    // We need a better way to know how many bytes were consumed.
+                    // `from_bytes` consumes the whole slice or errors.
+                    // Workaround: Try parsing a generic Value first to estimate size.
+                    let consumed = match de::from_bytes::<BencodeValue>(buf_slice) {
+                        Ok(value) => {
+                            // This is tricky. `serde_bencode` doesn't easily tells us bytes read.
+                            // We'll *assume* successful parsing means the message fit within the buffer.
+                            // Let's try to serialize the parsed msg back to estimate size.
+                            // THIS IS VERY INEFFICIENT AND A HACK.
+                            match ser::to_bytes(&msg) {
+                                Ok(bytes) => bytes.len(),
+                                Err(_) => buf_slice.len() // Fallback: consume whole buffer on error
+                            }
+                        },
+                        Err(_) => buf_slice.len() // Fallback: consume whole buffer on error
+                    };
+
+                    println!("Received msg: {:?} (consumed ~{} bytes)", msg, consumed);
+                    buffer.advance(consumed); // Consume the estimated message bytes from buffer
+
+                    // --- Message Handling Logic ---
+                    let mut sessions_guard = sessions.lock().await;
+                    let session_id_for_op = msg.session.as_ref().or(current_session_id.as_ref());
+
+                    match msg.op.as_str() {
+                        "clone" => {
+                            let new_session_id = uuid::Uuid::new_v4().to_string();
+                            // Use .cloned() on the Option<Arc<...>> directly
+                            let parent_context_opt = session_id_for_op.and_then(|sid| sessions_guard.get(sid).cloned());
+
+                            let new_context = if let Some(parent_ctx_arc) = parent_context_opt {
+                                let parent_guard = parent_ctx_arc.lock().await;
+                                Arc::new(Mutex::new(parent_guard.clone()))
+                            } else {
+                                Arc::new(Mutex::new(IndexMap::new()))
+                            };
+
+                            sessions_guard.insert(new_session_id.clone(), new_context);
+                            drop(sessions_guard);
+
+                            current_session_id = Some(new_session_id.clone());
+
+                            let response = NreplResponse {
+                                id: msg.id.as_deref(),
+                                session: Some(&new_session_id),
+                                status: vec!["done"],
+                                value: None,
+                                ex: None,
+                            };
+                            let resp_bytes = ser::to_bytes(&response)?;
+                            writer.write_all(&resp_bytes).await?;
+                            writer.flush().await?;
+                            println!("Sent clone response: {:?}", response);
+                        }
+                        "eval" => {
+                            if msg.code.is_none() {
+                                eprintln!("Eval request received without code");
+                                // TODO: Implement proper error response
+                                drop(sessions_guard);
+                                continue; // Should ideally break inner loop or handle error state better
+                            }
+                            let code = msg.code.as_ref().unwrap();
+
+                            let session_id = match session_id_for_op {
+                                Some(id) => id.clone(),
+                                None => {
+                                    let new_id = uuid::Uuid::new_v4().to_string();
+                                    sessions_guard.insert(new_id.clone(), Arc::new(Mutex::new(IndexMap::new())));
+                                    current_session_id = Some(new_id.clone());
+                                    new_id
+                                }
+                            };
+
+                            let context_arc = sessions_guard.get(&session_id).cloned();
+                            drop(sessions_guard); // Release lock on session store IMPORTANT
+
+                            if let Some(ctx_arc) = context_arc {
+                                let mut context_guard = ctx_arc.lock().await;
+                                match evaluate_form(code, &mut context_guard) {
+                                    Ok(value) => {
+                                        let response = NreplResponse {
+                                            id: msg.id.as_deref(),
+                                            session: Some(&session_id),
+                                            status: vec!["done"],
+                                            value: Some(format!("{:?}", value)),
+                                            ex: None,
+                                        };
+                                        let resp_bytes = ser::to_bytes(&response)?;
+                                        writer.write_all(&resp_bytes).await?;
+                                        println!("Sent eval response: {:?}", response);
+                                    }
+                                    Err(e) => {
+                                        let response = NreplResponse {
+                                            id: msg.id.as_deref(),
+                                            session: Some(&session_id),
+                                            status: vec!["error", "eval-error"],
+                                            value: None,
+                                            ex: Some(e.to_string()),
+                                        };
+                                        let resp_bytes = ser::to_bytes(&response)?;
+                                        writer.write_all(&resp_bytes).await?;
+                                        println!("Sent eval error response: {:?}", response);
+                                    }
+                                }
+                            } else {
+                                eprintln!("Error: Session ID '{}' context arc not found after unlocking store.", session_id);
+                                // TODO: Send error response
+                            }
+                        }
+                        "describe" => {
+                             drop(sessions_guard);
+                             let description = NreplResponse {
+                                 id: msg.id.as_deref(),
+                                 session: session_id_for_op.map(|s| s.as_str()),
+                                 status: vec!["done"],
+                                 value: Some(format!("{{\"ops\":{{\"eval\":{{}},\"clone\":{{}},\"describe\":{{}}}},\"versions\":{{\"garden\":\"{}\",\"nrepl\":\"{}\"}}}}",
+                                     env!("CARGO_PKG_VERSION"), "0.x (basic)")),
+                                 ex: None,
+                             };
+                             let resp_bytes = ser::to_bytes(&description)?;
+                             writer.write_all(&resp_bytes).await?;
+                             println!("Sent describe response: {:?}", description);
+                        }
+                        _ => {
+                            drop(sessions_guard);
+                            eprintln!("Unhandled op: {}", msg.op);
+                            let response = NreplResponse {
+                                id: msg.id.as_deref(),
+                                session: session_id_for_op.map(|s| s.as_str()),
+                                status: vec!["error", "unknown-op"],
+                                value: None,
+                                ex: Some(format!("Unknown op: {}", msg.op)),
+                            };
+                            let resp_bytes = ser::to_bytes(&response)?;
+                            writer.write_all(&resp_bytes).await?;
+                            println!("Sent unknown-op response: {:?}", response);
+                        }
+                    }
+                    writer.flush().await?;
+                }
+                Err(e) => {
+                    // Check if the error is due to insufficient data by checking the source
+                    let mut is_eof = false;
+                    if let Some(source) = e.source() {
+                        if let Some(io_err) = source.downcast_ref::<io::Error>() {
+                            if io_err.kind() == ErrorKind::UnexpectedEof {
+                                is_eof = true;
+                            }
+                        }
+                    }
+
+                    if is_eof {
+                        // Not enough data in the buffer yet, break inner loop and wait for more
+                         break;
+                    } else {
+                        // It's a persistent Bencode error or different IO error
+                        eprintln!("Bencode decode error: {}", e);
+                        // Simple error recovery: clear buffer. Might lose data.
+                        buffer.clear();
+                        // TODO: Send nREPL error response if possible (need msg ID)
+                        break; // Break inner loop on error
+                    }
+                }
+            }
+        } // End inner loop (message processing from buffer)
+    } // End outer loop (reading from socket)
+
     if let Some(sid) = current_session_id {
         println!("Cleaning up session: {}", sid);
-        sessions.lock().unwrap().remove(&sid);
+        sessions.lock().await.remove(&sid);
     }
 
     Ok(())
-}
-
-
-// We need a way to evaluate a single form string
-// This likely involves parsing the string and then calling the existing `eval` function
-fn evaluate_form_placeholder(code: &str, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
-     // 1. Parse the code string into one or more ExprAst nodes
-     // 2. Evaluate each node, updating the context
-     // 3. Return the result of the *last* evaluated node
-     // This is a placeholder - the actual implementation needs the parser from main.rs
-    println!("Evaluating form (placeholder): {}", code);
-    // Example: parse(code).and_then(|nodes| eval(&nodes[0], context)) // Simplified
-    Err(Error::EvalError("evaluate_form not fully implemented yet".to_string()))
 }
