@@ -1,3 +1,0 @@
-first useful program, sorter related
-
-the transfer of old database data with the ITEM/TAG model (10k votes, met gala 2024 tag, religious tags, tf2 tags, all my current progress). and transferring that to the new ENTITY model. its basic data transfomrations, and the babashka pod for postgres already exists.

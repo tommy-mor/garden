@@ -5,9 +5,6 @@ use indexmap::IndexMap;
 use reqwest;
 use std::error::Error as StdError;
 use futures::future::BoxFuture;
-
-mod nrepl;
-
 // === TYPES ===
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,7 +309,6 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Garden nREPL server...");
     // Start the nREPL server and keep it running
-    nrepl::start_server().await?;
     Ok(())
 }
 
