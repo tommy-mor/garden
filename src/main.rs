@@ -1,10 +1,13 @@
-use std::{collections::HashMap, fs, path::Path, iter::Peekable, str::Chars};
+use std::{collections::HashMap, fs, path::Path, iter::Peekable, str::Chars, sync::mpsc, time::Duration};
 use serde::{Serialize, Deserialize};
 use serde_json::Value as JsonValue;
 use indexmap::IndexMap;
 use reqwest;
 use std::error::Error as StdError;
 use futures::future::BoxFuture;
+use notify::{Watcher, RecursiveMode, recommended_watcher};
+use chrono;
+
 // === TYPES ===
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,7 +18,7 @@ enum ExprAst {
     String(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Number(i64),
     String(String),
@@ -42,6 +45,52 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[derive(Debug, Default)]
+pub struct ValueCache {
+    values: HashMap<String, Value>,
+    last_update: HashMap<String, String>,
+}
+
+impl ValueCache {
+    pub fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+            last_update: HashMap::new(),
+        }
+    }
+    
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.values.get(key)
+    }
+    
+    pub fn insert(&mut self, key: String, value: Value) {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.last_update.insert(key.clone(), now);
+        self.values.insert(key, value);
+    }
+    
+    pub fn save_to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(&self.values)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+    
+    pub fn load_from_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if !path.exists() {
+            return Ok(());
+        }
+        
+        let json = fs::read_to_string(path)?;
+        self.values = serde_json::from_str(&json)?;
+        
+        let now = chrono::Utc::now().to_rfc3339();
+        for key in self.values.keys() {
+            self.last_update.insert(key.clone(), now.clone());
+        }
+        Ok(())
+    }
+}
 
 // === Parser ===
 
@@ -304,6 +353,101 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.len() < 2 {
+        eprintln!("Usage: garden <file.expr>");
+        return Ok(());
+    }
+    
+    let file_path = Path::new(&args[1]);
+    let cache_path = file_path.with_extension("expr.value");
+    
+    // Initialize the value cache
+    let mut value_cache = ValueCache::new();
+    
+    // Try to load previous values
+    if let Err(e) = value_cache.load_from_file(&cache_path) {
+        eprintln!("Warning: Could not load cached values: {}", e);
+    }
+    
+    // Create a channel to receive file change events
+    let (tx, rx) = mpsc::channel();
+    
+    // Create a file watcher
+    let mut watcher = recommended_watcher(tx)?;
+    
+    // Watch the target file
+    watcher.watch(file_path, RecursiveMode::NonRecursive)?;
+    
+    println!("Garden is watching {}...", file_path.display());
+    println!("(Press Ctrl+C to exit)");
+    
+    // Create a context from ValueCache for evaluation
+    let mut context: IndexMap<String, Value> = IndexMap::new();
+    
+    // Initial run
+    if let Err(e) = run_once(file_path, &mut context).await {
+        eprintln!("Error: {}", e);
+    }
+    
+    // Save results to cache
+    for (key, value) in &context {
+        value_cache.insert(key.clone(), value.clone());
+    }
+    if let Err(e) = value_cache.save_to_file(&cache_path) {
+        eprintln!("Warning: Could not save cached values: {}", e);
+    }
+    
+    // Event loop
+    for res in rx {
+        match res {
+            Ok(_) => {
+                if let Err(e) = run_once(file_path, &mut context).await {
+                    eprintln!("Error: {}", e);
+                } else {
+                    // Update cache and save after successful run
+                    for (key, value) in &context {
+                        value_cache.insert(key.clone(), value.clone());
+                    }
+                    if let Err(e) = value_cache.save_to_file(&cache_path) {
+                        eprintln!("Warning: Could not save cached values: {}", e);
+                    }
+                }
+            }
+            Err(e) => eprintln!("Watch error: {:?}", e),
+        }
+    }
+    
+    Ok(())
+}
+
+async fn run_once(path: &Path, context: &mut IndexMap<String, Value>) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\nRevaluating expressions in {}...", path.display());
+    
+    let src = fs::read_to_string(path)?;
+    let ast_nodes = parse(&src)?;
+    
+    // Get the source lines for better display
+    let source_lines: Vec<&str> = src.lines().collect();
+    
+    for (i, node) in ast_nodes.iter().enumerate() {
+        let result = eval(node, context).await?;
+        
+        // For multiline expressions, this is simplified
+        let line_num = i + 1;
+        let source = if i < source_lines.len() {
+            source_lines[i]
+        } else {
+            "<unknown source>"
+        };
+        
+        // Format the output with colors (using ANSI escape codes)
+        // Clear the line, print source, then append value with green color
+        println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;32m=> {:?}\x1B[0m", 
+                 line_num, source, result);
+    }
+    
     Ok(())
 }
 
