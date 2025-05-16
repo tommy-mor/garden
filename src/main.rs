@@ -23,7 +23,7 @@ pub enum Value {
 }
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     ParseError(String),
     EvalError(String),
     HttpError(String),
@@ -283,13 +283,10 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
                             }
                         }
                         _ => {
-                            // Leniently handle unknown ops potentially sent by clients.
-                            // Instead of erroring, return a neutral value like "nil".
-                            // This might allow clients like CIDER to proceed past
-                            // their Clojure-specific setup code, though the op is ignored.
-                            // Optionally log a warning here:
-                            // eprintln!("Warning: Unknown function symbol '{}' encountered, returning nil.", op);
-                            Ok(Value::String("nil".to_string()))
+                            Err(Error::EvalError(format!(
+                                "Unknown function symbol '{}' encountered, returning nil.",
+                                op
+                            )))
                         }
                     }
                 } else {
@@ -307,8 +304,6 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting Garden nREPL server...");
-    // Start the nREPL server and keep it running
     Ok(())
 }
 
