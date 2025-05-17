@@ -13,6 +13,9 @@ use std::hash::{Hash, Hasher};
 use blake3;
 use hex;
 
+// Add pest parser module
+mod parser;
+
 // === TYPES ===
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -229,122 +232,7 @@ impl ValueCache {
 }
 
 // === Parser ===
-
-// Helper function to manage whitespace and line counting
-fn skip_whitespace_and_count_lines(tokens: &mut Peekable<Chars>, current_line: &mut usize) {
-    while let Some(&c) = tokens.peek() {
-        if c.is_whitespace() {
-            if c == '\n' {
-                *current_line += 1;
-            }
-            tokens.next();
-        } else {
-            break;
-        }
-    }
-}
-
-fn parse_expr(tokens: &mut Peekable<Chars>, current_line: &mut usize) -> Result<ExprAst, Error> {
-    skip_whitespace_and_count_lines(tokens, current_line);
-    let start_line = *current_line;
-
-    match tokens.peek() {
-        Some(&'(') => {
-            tokens.next(); // Consume '('
-            let mut list = Vec::new();
-            loop {
-                skip_whitespace_and_count_lines(tokens, current_line);
-                match tokens.peek() {
-                    Some(&')') => {
-                        tokens.next(); // Consume ')'
-                        break Ok(ExprAst::List(list, SourceSpan { line: start_line }));
-                    }
-                    Some(_) => {
-                        list.push(parse_expr(tokens, current_line)?);
-                    }
-                    None => {
-                        break Err(Error::ParseError(
-                            format!("Unexpected end of input on line {}, missing ')'", start_line),
-                        ));
-                    }
-                }
-            }
-        }
-        Some(&'"') => {
-            tokens.next(); // Consume opening '"'
-            let mut string_content = String::new();
-            let string_start_line = *current_line; // Use current_line after consuming opening quote
-            while let Some(&c) = tokens.peek() {
-                if c == '"' {
-                    tokens.next(); // Consume closing '"'
-                    return Ok(ExprAst::String(string_content, SourceSpan { line: string_start_line }));
-                }
-                if c == '\\' {
-                    tokens.next(); // Consume '\'
-                    if let Some(escaped_char) = tokens.next() {
-                        match escaped_char {
-                            'n' => string_content.push('\n'),
-                            't' => string_content.push('\t'),
-                            '\\' => string_content.push('\\'),
-                            '"' => string_content.push('"'),
-                            _ => return Err(Error::ParseError(format!("Invalid escape sequence: \\{} on line {}", escaped_char, *current_line))),
-                        }
-                    } else {
-                        return Err(Error::ParseError(format!("Unexpected end of input after escape character on line {}", *current_line)));
-                    }
-                } else {
-                    if c == '\n' {
-                        *current_line += 1;
-                    }
-                    string_content.push(tokens.next().unwrap());
-                }
-            }
-            Err(Error::ParseError(format!("Unexpected end of input, unclosed string literal starting on line {}", string_start_line)))
-        }
-        Some(_) => {
-            let atom_start_line = *current_line;
-            let mut atom = String::new();
-            while let Some(&c) = tokens.peek() {
-                if c.is_whitespace() || "()\"".contains(c) {
-                    break;
-                }
-                // Reading an atom does not cross lines unless the input is malformed without whitespace separators
-                // We rely on skip_whitespace_and_count_lines to handle line advances between atoms.
-                atom.push(tokens.next().unwrap());
-            }
-
-            if atom.is_empty() {
-                return Err(Error::ParseError(
-                    format!("Expected token, found none or only whitespace on line {}", atom_start_line),
-                ));
-            }
-
-            match atom.parse::<i64>() {
-                Ok(n) => Ok(ExprAst::Number(n, SourceSpan { line: atom_start_line })),
-                Err(_) => Ok(ExprAst::Symbol(atom, SourceSpan { line: atom_start_line })),
-            }
-        }
-        None => Err(Error::ParseError(
-            "Unexpected end of input".to_string(),
-        )),
-    }
-}
-
-fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
-    let mut tokens = input.chars().peekable();
-    let mut ast_nodes = Vec::new();
-    let mut current_line = 1; // Initialize line counter
-
-    loop {
-        skip_whitespace_and_count_lines(&mut tokens, &mut current_line);
-        if tokens.peek().is_none() {
-            break;
-        }
-        ast_nodes.push(parse_expr(&mut tokens, &mut current_line)?);
-    }
-
-    Ok(ast_nodes)
-}
+// Use the new pest-based parser module instead of the old parser functions
 
 // === Evaluator ===
 pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> BoxFuture<'a, Result<Value, Error>> {
@@ -642,7 +530,8 @@ async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache
     node_cache.prepare_for_evaluation();
     
     let src = fs::read_to_string(path)?;
-    let ast_nodes = parse(&src)?; // Vec<ExprAst> with SourceSpan
+    // Call the new parser module's parse function
+    let ast_nodes = parser::parse(&src)?; // Vec<ExprAst> with SourceSpan
     
     let mut roots = Vec::new();
     for ast_node in &ast_nodes {
@@ -675,17 +564,6 @@ async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache
         println!("No expressions changed in this evaluation.");
     } else {
         for item in display_items {
-            // Display node ID (hash)
-            // let id_hex = hex::encode(&root.id[0..4]); // First 4 bytes for display -- now in item.id_hex_short
-            
-            // For multiline expressions, this is simplified
-            // let line_num = i + 1; // now item.line
-            // let source = if i < source_lines.len() { // now item.code_snippet
-            //     source_lines[i]
-            // } else {
-            //     "<unknown source>"
-            // };
-            
             println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;36m[{}]\x1B[0m \x1B[0;32m=> {}\x1B[0m", 
                     item.line, item.code_snippet, item.id_hex_short, item.value_str);
         }
@@ -737,7 +615,8 @@ impl From<serde_json::Error> for Error {
 
 pub async fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Option<Value>), Box<dyn std::error::Error>> {
     let input = fs::read_to_string(file_path)?;
-    let ast_nodes = parse(&input)?;
+    // Call the new parser module's parse function
+    let ast_nodes = parser::parse(&input)?;
 
     let mut context: IndexMap<String, Value> = IndexMap::new();
     let mut last_result: Option<Value> = None;
@@ -751,7 +630,8 @@ pub async fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>,
 }
 
 pub async fn evaluate_form(code: &str, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
-    let ast_nodes = parse(code)?;
+    // Call the new parser module's parse function
+    let ast_nodes = parser::parse(code)?;
     let mut last_result: Option<Value> = None;
 
     for node in ast_nodes {

@@ -1,0 +1,18 @@
+// Whitespace and comments
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ ";" ~ (!("\n") ~ ANY)* ~ "\n" }
+
+// Basic tokens
+symbol = @{ (ASCII_ALPHA | "_" | "." | "+" | "-" | "*" | "/" | "!" | "?" | "<" | ">" | "=" | "|" | "&" | "$" | "%" | ":" ) ~ 
+           (ASCII_ALPHA | ASCII_DIGIT | "_" | "." | "+" | "-" | "*" | "/" | "!" | "?" | "<" | ">" | "=" | "|" | "&" | "$" | "%" | ":" )* }
+number = @{ "-"? ~ ASCII_DIGIT+ }
+string = ${ "\"" ~ inner_string ~ "\"" }
+inner_string = @{ (escape | (!("\"" | "\\") ~ ANY))* }
+escape = _{ "\\" ~ ("n" | "t" | "\\" | "\"") }
+
+// Lists and expressions
+list = { "(" ~ expr* ~ ")" }
+expr = _{ symbol | number | string | list }
+
+// Root rule for the entire program
+program = { SOI ~ expr* ~ EOI } 
