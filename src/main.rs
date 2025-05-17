@@ -491,18 +491,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     let file_path = Path::new(&args[1]);
-    let cache_path = file_path.with_extension("expr.value");
+    let value_cache_path = file_path.with_extension("expr.value");
+    let node_cache_path = file_path.with_extension("expr.nodecache");
     
     // Initialize the value cache
     let mut value_cache = ValueCache::new();
     
     // Try to load previous values
-    if let Err(e) = value_cache.load_from_file(&cache_path) {
+    if let Err(e) = value_cache.load_from_file(&value_cache_path) {
         eprintln!("Warning: Could not load cached values: {}", e);
     }
     
-    // Initialize the node cache
+    // Initialize the node cache and load previous state if available
     let mut node_cache = NodeCache::new();
+    if let Err(e) = node_cache.load_from_file(&node_cache_path) {
+        eprintln!("Warning: Could not load node cache: {}", e);
+    }
     
     // Create a channel to receive file change events
     let (tx, rx) = mpsc::channel();
@@ -524,12 +528,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Error: {}", e);
     }
     
-    // Save results to cache
+    // Save caches
     for (key, value) in &context {
         value_cache.insert(key.clone(), value.clone());
     }
-    if let Err(e) = value_cache.save_to_file(&cache_path) {
+    if let Err(e) = value_cache.save_to_file(&value_cache_path) {
         eprintln!("Warning: Could not save cached values: {}", e);
+    }
+    if let Err(e) = node_cache.save_to_file(&node_cache_path) {
+        eprintln!("Warning: Could not save node cache: {}", e);
     }
     
     // Event loop
@@ -543,8 +550,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for (key, value) in &context {
                         value_cache.insert(key.clone(), value.clone());
                     }
-                    if let Err(e) = value_cache.save_to_file(&cache_path) {
+                    if let Err(e) = value_cache.save_to_file(&value_cache_path) {
                         eprintln!("Warning: Could not save cached values: {}", e);
+                    }
+                    if let Err(e) = node_cache.save_to_file(&node_cache_path) {
+                        eprintln!("Warning: Could not save node cache: {}", e);
                     }
                 }
             }
@@ -558,6 +568,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache: &mut NodeCache) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nRevaluating expressions in {}...", path.display());
     
+    // Prepare NodeCache for a new evaluation cycle
+    node_cache.prepare_for_evaluation();
+    
     let src = fs::read_to_string(path)?;
     let ast_nodes = parse(&src)?;
     
@@ -566,34 +579,50 @@ async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache
     
     // Convert AST to Node Tree (immutable, structurally-hashed)
     let mut roots = Vec::new();
+    let mut changed_nodes = Vec::new();
+    
     for node in &ast_nodes {
-        roots.push(ast_to_node_tree(node));
+        let root = ast_to_node_tree(node);
+        
+        // Check if this root node was changed in the last evaluation
+        let before_eval = node_cache.was_changed(&root.id);
+        
+        // Evaluate the node
+        let result = eval_node(&root, context, node_cache).await?;
+        
+        // Check if this node was changed after evaluation
+        let after_eval = node_cache.was_changed(&root.id);
+        
+        // Store changed nodes for display
+        if !before_eval && after_eval {
+            changed_nodes.push((roots.len(), root.clone(), result));
+        }
+        
+        roots.push(root);
     }
     
-    println!("Evaluation results:");
-    for (i, root) in roots.iter().enumerate() {
-        // Display node ID (hash)
-        let id_hex = hex::encode(&root.id[0..4]); // First 4 bytes for display
-        
-        // Check if we already have this node in cache
-        let is_cached = node_cache.get(&root.id).is_some();
-        let cache_status = if is_cached { "(cached)" } else { "" };
-        
-        // Evaluate using the new memoized evaluator
-        let result = eval_node(root, context, node_cache).await?;
-        
-        // For multiline expressions, this is simplified
-        let line_num = i + 1;
-        let source = if i < source_lines.len() {
-            source_lines[i]
-        } else {
-            "<unknown source>"
-        };
-        
-        // Format the output with colors (using ANSI escape codes)
-        // Clear the line, print source, node ID, then append value with green color
-        println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;36m[{} {}]\x1B[0m \x1B[0;32m=> {:?}\x1B[0m", 
-                 line_num, source, id_hex, cache_status, result);
+    // Display only the changed nodes
+    println!("Changed expressions:");
+    
+    if changed_nodes.is_empty() {
+        println!("No expressions changed in this evaluation.");
+    } else {
+        for (i, root, result) in changed_nodes {
+            // Display node ID (hash)
+            let id_hex = hex::encode(&root.id[0..4]); // First 4 bytes for display
+            
+            // For multiline expressions, this is simplified
+            let line_num = i + 1;
+            let source = if i < source_lines.len() {
+                source_lines[i]
+            } else {
+                "<unknown source>"
+            };
+            
+            // Format the output with colors (using ANSI escape codes)
+            println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;36m[{}]\x1B[0m \x1B[0;32m=> {:?}\x1B[0m", 
+                    line_num, source, id_hex, result);
+        }
     }
     
     Ok(())
@@ -719,7 +748,7 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
                 );
             }
             
-            // Create child nodes
+            // Create child nodes for ALL items including the operator
             let children: Vec<Rc<Node>> = items.iter().map(ast_to_node_tree).collect();
             
             // Determine the operation type from the first item if it's a symbol
@@ -802,6 +831,8 @@ type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub struct NodeCache {
     values: HashMap<NodeId, Result<Value, Error>>,
     last_update: HashMap<NodeId, String>, // ISO timestamp
+    changed_nodes: std::collections::HashSet<NodeId>, // Tracks nodes changed in current run
+    previously_seen: std::collections::HashSet<NodeId>, // Tracks all nodes seen before the current run
 }
 
 impl NodeCache {
@@ -809,6 +840,8 @@ impl NodeCache {
         Self {
             values: HashMap::new(),
             last_update: HashMap::new(),
+            changed_nodes: std::collections::HashSet::new(),
+            previously_seen: std::collections::HashSet::new(),
         }
     }
     
@@ -817,27 +850,144 @@ impl NodeCache {
     }
     
     pub fn insert(&mut self, id: NodeId, value: Result<Value, Error>) {
-        let now = chrono::Utc::now().to_rfc3339();
-        self.last_update.insert(id, now);
+        // A node is considered changed if:
+        // 1. It didn't exist before OR
+        // 2. Its value is different from the previous value
+        let is_changed = match self.values.get(&id) {
+            Some(old_value) => {
+                // Compare the string representation of the values
+                let old_str = format!("{:?}", old_value);
+                let new_str = format!("{:?}", &value);
+                old_str != new_str
+            },
+            None => true // New node
+        };
+        
+        if is_changed {
+            // Track this node as changed
+            self.changed_nodes.insert(id);
+            
+            // Update the value and timestamp
+            let now = chrono::Utc::now().to_rfc3339();
+            self.last_update.insert(id, now);
+        }
+        
+        // Always update the value, even if it hasn't changed
         self.values.insert(id, value);
     }
     
-    // Additional methods for loading/saving cache to be implemented
+    // Check if a node was changed in the current cycle
+    pub fn was_changed(&self, id: &NodeId) -> bool {
+        self.changed_nodes.contains(id)
+    }
+    
+    // Manually mark a node as changed (for propagating changes up the tree)
+    pub fn mark_changed(&mut self, id: NodeId) {
+        self.changed_nodes.insert(id);
+    }
+    
+    // Before starting a new evaluation cycle, snapshot the current state
+    pub fn prepare_for_evaluation(&mut self) {
+        self.changed_nodes.clear();
+        
+        // Keep track of all nodes we've seen before
+        for id in self.values.keys() {
+            self.previously_seen.insert(*id);
+        }
+    }
+    
+    // Save cache to disk
+    pub fn save_to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        // Convert NodeIds to hex strings for JSON serialization
+        let mut serializable_values = HashMap::new();
+        
+        for (id, value) in &self.values {
+            let id_hex = hex::encode(id);
+            
+            // We need to convert Result<Value, Error> to a serializable format
+            let value_str = match value {
+                Ok(v) => serde_json::to_string(v)?,
+                Err(e) => format!("Error: {}", e),
+            };
+            
+            serializable_values.insert(id_hex, value_str);
+        }
+        
+        let json = serde_json::to_string_pretty(&serializable_values)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+    
+    // Load cache from disk
+    pub fn load_from_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if !path.exists() {
+            return Ok(());
+        }
+        
+        
+        let json = fs::read_to_string(path)?;
+        let serializable_values: HashMap<String, String> = serde_json::from_str(&json)?;
+        
+        for (id_hex, value_str) in serializable_values {
+            // Convert hex string back to NodeId
+            let id_bytes = hex::decode(&id_hex)?;
+            if id_bytes.len() != 32 {
+                continue; // Skip invalid entries
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&id_bytes);
+            
+            // Try to parse as Value
+            if let Ok(value) = serde_json::from_str::<Value>(&value_str) {
+                self.values.insert(id, Ok(value));
+                self.previously_seen.insert(id);
+            } else {
+                // It's an error string, store as error
+                self.values.insert(id, Err(Error::EvalError(value_str.trim_start_matches("Error: ").to_string())));
+                self.previously_seen.insert(id);
+            }
+            
+            // Set timestamp to now
+            self.last_update.insert(id, chrono::Utc::now().to_rfc3339());
+        }
+        
+        Ok(())
+    }
 }
 
-// Memoized evaluation of a Node tree - this function embodies the core reactivity of Garden
+// Memoized evaluation of a Node tree
 pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value>, cache: &'a mut NodeCache) 
     -> LocalBoxFuture<'a, Result<Value, Error>> {
     Box::pin(async move {
-        // Check if we already have a cached result for this node
-        if let Some(cached_result) = cache.get(&node.id) {
-            return cached_result.clone();
+        // Get the node ID for easy reference
+        let node_id = node.id;
+        
+        // Check if we already have a cached result for this node that isn't a symbol
+        // Symbol nodes are re-evaluated if their underlying context value might have changed,
+        // or if the symbol itself is part of a definition that changes.
+        if !matches!(&node.kind, NodeKind::Symbol(_)) {
+            if let Some(cached_value) = cache.get(&node_id) {
+                 // If this node or any of its children were not marked as changed in this cycle,
+                 // and it was seen before, we can potentially reuse the cache.
+                 // However, for simplicity and correctness, especially with 'def',
+                 // we will rely on the individual handlers to manage re-evaluation logic for now.
+                 // The main check is that if a node's *dependencies* change, it *must* re-evaluate.
+                 // The `cache.insert` at the end will determine if its own value changed.
+                return cached_value.clone();
+            }
         }
         
-        // If not in cache, we need to evaluate
+        // Evaluate this node based on its kind
         let result = match &node.kind {
             NodeKind::Symbol(name) => {
                 // Symbol lookup
+                // Check cache first, but symbols can change if context changes,
+                // so a simple cache hit isn't always enough.
+                // However, the 'changed_nodes' tracking should help.
+                // If a 'def' changes a symbol, the 'def' node changes,
+                // and any node *using* that symbol should ideally be re-evaluated.
+                // This part is tricky and might need further refinement for optimal caching.
+                // For now, direct lookup is fine, caching happens at the end.
                 context.get(name)
                     .cloned()
                     .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", name)))
@@ -852,156 +1002,214 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
             },
             NodeKind::Definition => {
                 // Definition (def name value)
+                // Children: 0: 'def' symbol, 1: name symbol, 2: value expression
                 if node.children.len() != 3 {
                     return Err(Error::EvalError(format!(
-                        "'def' expects 2 arguments, got {}",
-                        node.children.len() - 1
+                        "'def' expects 2 arguments (name, value), corresponding to 3 children (def, name, value). Got {} children.",
+                        node.children.len()
                     )));
                 }
                 
-                // Get symbol name from first argument
-                if let NodeKind::Symbol(var_name) = &node.children[1].kind {
-                    // Evaluate the value (second argument)
-                    let value = eval_node(&node.children[2], context, cache).await?;
-                    
-                    // Store in context
-                    context.insert(var_name.clone(), value.clone());
-                    Ok(value)
+                // Arg 1 (child 1) is the variable name symbol
+                let var_name_node = &node.children[1];
+                let var_name = if let NodeKind::Symbol(name) = &var_name_node.kind {
+                    name.clone()
                 } else {
-                    Err(Error::EvalError("'def' first argument must be a symbol".to_string()))
-                }
+                    return Err(Error::EvalError(
+                        "'def' first argument must be a symbol representing the variable name".to_string(),
+                    ));
+                };
+
+                // Arg 2 (child 2) is the value expression
+                let value_expr_node = &node.children[2];
+                let value = eval_node(value_expr_node, context, cache).await?;
+                
+                // Store in context
+                context.insert(var_name.clone(), value.clone());
+                
+                // 'def' itself evaluates to the value assigned
+                Ok(value)
             },
             NodeKind::Addition => {
                 // Addition (+ a b c ...)
-                let mut sum = 0;
-                
-                // Skip the operator node (first child)
-                for child in &node.children[1..] {
-                    match eval_node(child, context, cache).await? {
-                        Value::Number(n) => sum += n,
-                        _ => return Err(Error::EvalError("'+' requires number arguments".to_string())),
-                    }
+                // Children: 0: '+' symbol, 1...N: arguments
+                if node.children.len() < 2 { // Needs at least operator and one arg for meaningful operation
+                    return Err(Error::EvalError("'+' requires at least 1 argument".to_string()));
                 }
                 
+                let mut sum = 0;
+                // Evaluate argument children (starting from index 1)
+                for i in 1..node.children.len() {
+                    let arg_node = &node.children[i];
+                    let val = eval_node(arg_node, context, cache).await?;
+                    match val {
+                        Value::Number(n) => sum += n,
+                        _ => return Err(Error::EvalError(
+                            "'+' requires all arguments to be numbers".to_string(),
+                        )),
+                    }
+                }
                 Ok(Value::Number(sum))
             },
             NodeKind::Multiplication => {
                 // Multiplication (* a b c ...)
-                let mut product = 1;
-                
-                // Skip the operator node (first child)
-                for child in &node.children[1..] {
-                    match eval_node(child, context, cache).await? {
-                        Value::Number(n) => product *= n,
-                        _ => return Err(Error::EvalError("'*' requires number arguments".to_string())),
-                    }
+                // Children: 0: '*' symbol, 1...N: arguments
+                if node.children.len() < 2 {
+                    return Err(Error::EvalError("'*' requires at least 1 argument".to_string()));
                 }
                 
+                let mut product = 1;
+                // Evaluate argument children (starting from index 1)
+                for i in 1..node.children.len() {
+                    let arg_node = &node.children[i];
+                    let val = eval_node(arg_node, context, cache).await?;
+                    match val {
+                        Value::Number(n) => product *= n,
+                        _ => return Err(Error::EvalError(
+                            "'*' requires all arguments to be numbers".to_string(),
+                        )),
+                    }
+                }
                 Ok(Value::Number(product))
             },
             NodeKind::HttpGet => {
                 // HTTP GET (http.get url)
+                // Children: 0: 'http.get' symbol, 1: url expression
                 if node.children.len() != 2 {
                     return Err(Error::EvalError(
-                        "'http.get' expects 1 argument (url)".into(),
+                        "'http.get' expects 1 argument (url), so 2 children in the node.".into(),
                     ));
                 }
                 
-                match eval_node(&node.children[1], context, cache).await? {
+                // Evaluate the URL argument node (child 1)
+                let url_expr_node = &node.children[1];
+                match eval_node(url_expr_node, context, cache).await? {
                     Value::String(url) => {
+                        // Perform the HTTP GET request
+                        // This is an I/O operation, so it's inherently not "pure"
+                        // Caching relies on the URL string itself. If URL changes, node hash changes.
+                        // If content at URL changes but URL string doesn't, cache won't see it unless forced.
                         let body = reqwest::get(&url).await?.text().await?;
                         Ok(Value::String(body))
                     }
                     _ => Err(Error::EvalError(
-                        "'http.get' expects a string argument".into(),
+                        "'http.get' expects its argument to evaluate to a string URL".into(),
                     )),
                 }
             },
             NodeKind::JsonParse => {
                 // JSON Parse (json.parse json_string)
+                // Children: 0: 'json.parse' symbol, 1: string expression
                 if node.children.len() != 2 {
                     return Err(Error::EvalError(
-                        "'json.parse' expects 1 argument (string)".into(),
+                        "'json.parse' expects 1 argument (a string to parse)".into(),
                     ));
                 }
                 
-                match eval_node(&node.children[1], context, cache).await? {
+                // Evaluate the string argument node (child 1)
+                let string_expr_node = &node.children[1];
+                match eval_node(string_expr_node, context, cache).await? {
                     Value::String(s) => {
                         let json_data: JsonValue = serde_json::from_str(&s)?;
                         Ok(Value::Json(json_data))
                     }
                     _ => Err(Error::EvalError(
-                        "'json.parse' expects a string argument".into(),
+                        "'json.parse' expects its argument to evaluate to a string".into(),
                     )),
                 }
             },
             NodeKind::JsonGet => {
-                // JSON Get (get json_obj key)
+                // JSON Get (get json_obj key_string)
+                // Children: 0: 'get' symbol, 1: json_obj expression, 2: key_string expression
                 if node.children.len() != 3 {
                     return Err(Error::EvalError(
-                        "'get' expects 2 arguments (json, key)".into(),
+                        "'get' expects 2 arguments (a JSON object, a string key)".into(),
                     ));
                 }
                 
-                let json_arg = eval_node(&node.children[1], context, cache).await?;
-                let key_arg = eval_node(&node.children[2], context, cache).await?;
+                // Evaluate the JSON object argument (child 1)
+                let json_obj_expr_node = &node.children[1];
+                let json_val = eval_node(json_obj_expr_node, context, cache).await?;
                 
-                match (&json_arg, &key_arg) {
-                    (Value::Json(json), Value::String(key)) => {
-                        match json.get(key) {
-                            Some(v) => convert_json_value(v.clone()),
+                // Evaluate the key string argument (child 2)
+                let key_string_expr_node = &node.children[2];
+                let key_val = eval_node(key_string_expr_node, context, cache).await?;
+                
+                match (json_val, key_val) {
+                    (Value::Json(json_data), Value::String(key)) => {
+                        match json_data.get(&key) {
+                            Some(v) => convert_json_value(v.clone()), // convert_json_value handles errors for unsupported types
                             None => Err(Error::EvalError(format!(
                                 "Key '{}' not found in JSON object",
                                 key
                             ))),
                         }
                     }
-                    _ => Err(Error::EvalError(format!(
-                        "'get' expects (json, string) arguments, got ({:?}, {:?})",
-                        &json_arg, &key_arg
+                    (Value::Json(_), other_key_type) => Err(Error::EvalError(format!(
+                        "'get' expects the second argument (key) to be a string, got {:?}",
+                        other_key_type
+                    ))),
+                    (other_json_type, _) => Err(Error::EvalError(format!(
+                        "'get' expects the first argument to be a JSON object, got {:?}",
+                        other_json_type
                     ))),
                 }
             },
             NodeKind::StringUpper => {
-                // String to uppercase (str.upper string)
+                // String to uppercase (str.upper string_expr)
+                // Children: 0: 'str.upper' symbol, 1: string expression
                 if node.children.len() != 2 {
                     return Err(Error::EvalError(
-                        "'str.upper' expects 1 argument (string)".into(),
+                        "'str.upper' expects 1 argument (a string)".into(),
                     ));
                 }
                 
-                match eval_node(&node.children[1], context, cache).await? {
-                    Value::String(s) => {
-                        Ok(Value::String(s.to_uppercase()))
-                    }
-                    _ => Err(Error::EvalError(
-                        "'str.upper' expects a string argument".into(),
-                    )),
+                // Evaluate the string argument (child 1)
+                let string_expr_node = &node.children[1];
+                match eval_node(string_expr_node, context, cache).await? {
+                    Value::String(s) => Ok(Value::String(s.to_uppercase())),
+                    other_type => Err(Error::EvalError(format!(
+                        "'str.upper' expects its argument to evaluate to a string, got {:?}",
+                        other_type
+                    ))),
                 }
             },
             NodeKind::List => {
                 // Generic list or unknown function call
                 if node.children.is_empty() {
-                    return Err(Error::EvalError("Cannot evaluate empty list".to_string()));
+                    // This case should ideally be caught by the parser or ast_to_node_tree
+                    // Or result in a NodeKind that's not generic List if it's ()
+                    return Err(Error::EvalError("Cannot evaluate an empty list node directly. If it's an empty S-expression '()', its NodeKind should reflect that.".to_string()));
                 }
                 
-                // If first child is a symbol, it should be a function
-                if let NodeKind::Symbol(func_name) = &node.children[0].kind {
+                // The first child of a List node (if not a special form handled above)
+                // would be the function to call.
+                let func_expr_node = &node.children[0];
+                
+                // What is it? If it's a symbol, it's an attempt to call a function by that name.
+                if let NodeKind::Symbol(func_name) = &func_expr_node.kind {
+                    // Here, we would look up `func_name` in the context.
+                    // If it's a user-defined function (not yet supported by this interpreter)
+                    // or a built-in that wasn't converted to a specific NodeKind (e.g. if '+' was a generic List),
+                    // we'd handle it.
+                    // For now, unknown symbols as functions are errors.
                     Err(Error::EvalError(format!(
-                        "Unknown function '{}' encountered",
-                        func_name
+                        "Attempted to call '{}' as a function, but it's either undefined or not a known built-in operation recognized by its specific NodeKind. Code: '{}'",
+                        func_name, node.code_snippet
                     )))
                 } else {
+                    // If the head of the list is not a symbol, it's an error (e.g. ((+ 1 2) 3))
                     Err(Error::EvalError(format!(
-                        "Cannot evaluate non-function list: {:?}",
-                        node.code_snippet
+                        "The first element of a list to be evaluated as a function call must be a symbol. Got: {:?}. Code: '{}'",
+                        func_expr_node.kind, node.code_snippet
                     )))
                 }
             }
         };
         
-        // Cache the result before returning
-        cache.insert(node.id, result.clone());
+        // Cache the result. `cache.insert` will also handle marking the node as changed
+        // if its new value is different from a previously cached one, or if it's new.
+        cache.insert(node_id, result.clone());
         
         result
     })
