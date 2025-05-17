@@ -15,12 +15,18 @@ use hex;
 
 // === TYPES ===
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceSpan {
+    line: usize,
+    // column: usize, // TODO: Add column later
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ExprAst {
-    Symbol(String),
-    Number(i64),
-    List(Vec<ExprAst>),
-    String(String),
+    Symbol(String, SourceSpan),
+    Number(i64, SourceSpan),
+    List(Vec<ExprAst>, SourceSpan),
+    String(String, SourceSpan),
 }
 
 // Node ID based on content hash
@@ -224,80 +230,98 @@ impl ValueCache {
 
 // === Parser ===
 
-fn parse_expr(tokens: &mut Peekable<Chars>) -> Result<ExprAst, Error> {
-    while tokens.peek().map_or(false, |c| c.is_whitespace()) {
-        tokens.next();
+// Helper function to manage whitespace and line counting
+fn skip_whitespace_and_count_lines(tokens: &mut Peekable<Chars>, current_line: &mut usize) {
+    while let Some(&c) = tokens.peek() {
+        if c.is_whitespace() {
+            if c == '\n' {
+                *current_line += 1;
+            }
+            tokens.next();
+        } else {
+            break;
+        }
     }
+}
+
+fn parse_expr(tokens: &mut Peekable<Chars>, current_line: &mut usize) -> Result<ExprAst, Error> {
+    skip_whitespace_and_count_lines(tokens, current_line);
+    let start_line = *current_line;
 
     match tokens.peek() {
         Some(&'(') => {
-            tokens.next();
+            tokens.next(); // Consume '('
             let mut list = Vec::new();
             loop {
-                while tokens.peek().map_or(false, |c| c.is_whitespace()) {
-                    tokens.next();
-                }
+                skip_whitespace_and_count_lines(tokens, current_line);
                 match tokens.peek() {
                     Some(&')') => {
-                        tokens.next();
-                        break Ok(ExprAst::List(list));
+                        tokens.next(); // Consume ')'
+                        break Ok(ExprAst::List(list, SourceSpan { line: start_line }));
                     }
                     Some(_) => {
-                        list.push(parse_expr(tokens)?);
+                        list.push(parse_expr(tokens, current_line)?);
                     }
                     None => {
                         break Err(Error::ParseError(
-                            "Unexpected end of input, missing ')'".to_string(),
+                            format!("Unexpected end of input on line {}, missing ')'", start_line),
                         ));
                     }
                 }
             }
         }
         Some(&'"') => {
-            tokens.next();
+            tokens.next(); // Consume opening '"'
             let mut string_content = String::new();
+            let string_start_line = *current_line; // Use current_line after consuming opening quote
             while let Some(&c) = tokens.peek() {
                 if c == '"' {
-                    tokens.next();
-                    return Ok(ExprAst::String(string_content));
+                    tokens.next(); // Consume closing '"'
+                    return Ok(ExprAst::String(string_content, SourceSpan { line: string_start_line }));
                 }
                 if c == '\\' {
-                    tokens.next();
+                    tokens.next(); // Consume '\'
                     if let Some(escaped_char) = tokens.next() {
                         match escaped_char {
                             'n' => string_content.push('\n'),
                             't' => string_content.push('\t'),
                             '\\' => string_content.push('\\'),
                             '"' => string_content.push('"'),
-                            _ => return Err(Error::ParseError(format!("Invalid escape sequence: \\{}", escaped_char))),
+                            _ => return Err(Error::ParseError(format!("Invalid escape sequence: \\{} on line {}", escaped_char, *current_line))),
                         }
                     } else {
-                        return Err(Error::ParseError("Unexpected end of input after escape character".to_string()));
+                        return Err(Error::ParseError(format!("Unexpected end of input after escape character on line {}", *current_line)));
                     }
                 } else {
+                    if c == '\n' {
+                        *current_line += 1;
+                    }
                     string_content.push(tokens.next().unwrap());
                 }
             }
-            Err(Error::ParseError("Unexpected end of input, unclosed string literal".to_string()))
+            Err(Error::ParseError(format!("Unexpected end of input, unclosed string literal starting on line {}", string_start_line)))
         }
         Some(_) => {
+            let atom_start_line = *current_line;
             let mut atom = String::new();
             while let Some(&c) = tokens.peek() {
                 if c.is_whitespace() || "()\"".contains(c) {
                     break;
                 }
+                // Reading an atom does not cross lines unless the input is malformed without whitespace separators
+                // We rely on skip_whitespace_and_count_lines to handle line advances between atoms.
                 atom.push(tokens.next().unwrap());
             }
 
             if atom.is_empty() {
                 return Err(Error::ParseError(
-                    "Expected token, found none or only whitespace".to_string(),
+                    format!("Expected token, found none or only whitespace on line {}", atom_start_line),
                 ));
             }
 
             match atom.parse::<i64>() {
-                Ok(n) => Ok(ExprAst::Number(n)),
-                Err(_) => Ok(ExprAst::Symbol(atom)),
+                Ok(n) => Ok(ExprAst::Number(n, SourceSpan { line: atom_start_line })),
+                Err(_) => Ok(ExprAst::Symbol(atom, SourceSpan { line: atom_start_line })),
             }
         }
         None => Err(Error::ParseError(
@@ -309,15 +333,14 @@ fn parse_expr(tokens: &mut Peekable<Chars>) -> Result<ExprAst, Error> {
 fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
     let mut tokens = input.chars().peekable();
     let mut ast_nodes = Vec::new();
+    let mut current_line = 1; // Initialize line counter
 
-    while tokens.peek().is_some() {
-        while tokens.peek().map_or(false, |c| c.is_whitespace()) {
-            tokens.next();
-        }
+    loop {
+        skip_whitespace_and_count_lines(&mut tokens, &mut current_line);
         if tokens.peek().is_none() {
             break;
         }
-        ast_nodes.push(parse_expr(&mut tokens)?);
+        ast_nodes.push(parse_expr(&mut tokens, &mut current_line)?);
     }
 
     Ok(ast_nodes)
@@ -327,13 +350,13 @@ fn parse(input: &str) -> Result<Vec<ExprAst>, Error> {
 pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> BoxFuture<'a, Result<Value, Error>> {
     Box::pin(async move {
         match ast {
-            ExprAst::Symbol(s) => Ok(context
+            ExprAst::Symbol(s, _) => Ok(context
                 .get(s)
                 .cloned()
                 .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", s)))?),
-            ExprAst::Number(n) => Ok(Value::Number(*n)),
-            ExprAst::String(s) => Ok(Value::String(s.clone())),
-            ExprAst::List(list) => {
+            ExprAst::Number(n, _) => Ok(Value::Number(*n)),
+            ExprAst::String(s, _) => Ok(Value::String(s.clone())),
+            ExprAst::List(list, _list_span) => {
                 if list.is_empty() {
                     return Err(Error::EvalError("Cannot evaluate empty list".to_string()));
                 }
@@ -341,7 +364,7 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
                 let op_node = &list[0];
                 let args = &list[1..];
 
-                if let ExprAst::Symbol(op) = op_node {
+                if let ExprAst::Symbol(op, _op_span) = op_node {
                     match op.as_str() {
                         "def" => {
                             if args.len() != 2 {
@@ -353,7 +376,7 @@ pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> B
                             let var_name_node = &args[0];
                             let value_node = &args[1];
 
-                            if let ExprAst::Symbol(var_name) = var_name_node {
+                            if let ExprAst::Symbol(var_name, _var_span) = var_name_node {
                                 let value = eval(value_node, context).await?;
                                 context.insert(var_name.clone(), value.clone());
                                 Ok(value)
@@ -565,63 +588,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// New struct for display
+#[derive(Debug)]
+struct DisplayInfo {
+    line: usize,
+    code_snippet: String,
+    id_hex_short: String, // Short version of NodeId hex
+    value_str: String,   // String representation of the Value or Error
+}
+
+fn collect_display_info_recursive(
+    node: &Rc<Node>,
+    node_cache: &NodeCache,
+    display_items: &mut Vec<DisplayInfo>,
+    visited_for_display: &mut std::collections::HashSet<NodeId>
+) {
+    if !visited_for_display.insert(node.id) { // If already visited, skip
+        return;
+    }
+
+    // Check if this node was marked as changed during the latest evaluation cycle
+    if node_cache.was_changed(&node.id) {
+        let line_str = node.metadata.get("line")
+            .expect("Node metadata should contain 'line' information after parsing");
+        let line = line_str.parse::<usize>()
+            .expect("Line metadata should be a parsable usize");
+
+        let id_hex_short = hex::encode(&node.id[0..4]); // First 4 bytes for display
+
+        let value_representation = match node_cache.get(&node.id) {
+            Some(Ok(value)) => format!("{:?}", value), // Or a more custom pretty print
+            Some(Err(error)) => format!("Error: {}", error),
+            None => "Value not found in cache (Error: should not happen for a node marked as changed)".to_string(),
+        };
+
+        display_items.push(DisplayInfo {
+            line,
+            code_snippet: node.code_snippet.clone(),
+            id_hex_short,
+            value_str: value_representation,
+        });
+    }
+
+    // Recursively visit children
+    for child in &node.children {
+        collect_display_info_recursive(child, node_cache, display_items, visited_for_display);
+    }
+}
+
 async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache: &mut NodeCache) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nRevaluating expressions in {}...", path.display());
     
-    // Prepare NodeCache for a new evaluation cycle
     node_cache.prepare_for_evaluation();
     
     let src = fs::read_to_string(path)?;
-    let ast_nodes = parse(&src)?;
+    let ast_nodes = parse(&src)?; // Vec<ExprAst> with SourceSpan
     
-    // Get the source lines for better display
-    let source_lines: Vec<&str> = src.lines().collect();
-    
-    // Convert AST to Node Tree (immutable, structurally-hashed)
     let mut roots = Vec::new();
-    let mut changed_nodes = Vec::new();
-    
-    for node in &ast_nodes {
-        let root = ast_to_node_tree(node);
-        
-        // Check if this root node was changed in the last evaluation
-        let before_eval = node_cache.was_changed(&root.id);
-        
-        // Evaluate the node
-        let result = eval_node(&root, context, node_cache).await?;
-        
-        // Check if this node was changed after evaluation
-        let after_eval = node_cache.was_changed(&root.id);
-        
-        // Store changed nodes for display
-        if !before_eval && after_eval {
-            changed_nodes.push((roots.len(), root.clone(), result));
+    for ast_node in &ast_nodes {
+        let root_node = ast_to_node_tree(ast_node);
+        // Evaluate the node. eval_node uses/updates cache and context.
+        // Errors during evaluation are also cached by eval_node.
+        if let Err(e) = eval_node(&root_node, context, node_cache).await {
+            // Even if eval_node returns an error here, it should have been cached.
+            // The display logic below will pick up errors from the cache.
+            // However, we might want to log a more immediate, less structured error for top-level failures.
+            eprintln!("Note: A top-level expression resulted in an error: {}. Code: {}. It will be listed in changed expressions if its error state is new.", e, root_node.code_snippet);
         }
-        
-        roots.push(root);
+        roots.push(root_node);
     }
     
-    // Display only the changed nodes
-    println!("Changed expressions:");
+    // Collect all changed nodes for display by traversing the graph
+    // and checking against node_cache.changed_nodes
+    let mut display_items: Vec<DisplayInfo> = Vec::new();
+    let mut visited_for_display: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+    for root_node in &roots {
+        collect_display_info_recursive(root_node, node_cache, &mut display_items, &mut visited_for_display);
+    }
     
-    if changed_nodes.is_empty() {
+    // Sort by line number for ordered output
+    display_items.sort_by_key(|item| item.line);
+    
+    println!("Changed expressions:");
+    if display_items.is_empty() {
         println!("No expressions changed in this evaluation.");
     } else {
-        for (i, root, result) in changed_nodes {
+        for item in display_items {
             // Display node ID (hash)
-            let id_hex = hex::encode(&root.id[0..4]); // First 4 bytes for display
+            // let id_hex = hex::encode(&root.id[0..4]); // First 4 bytes for display -- now in item.id_hex_short
             
             // For multiline expressions, this is simplified
-            let line_num = i + 1;
-            let source = if i < source_lines.len() {
-                source_lines[i]
-            } else {
-                "<unknown source>"
-            };
+            // let line_num = i + 1; // now item.line
+            // let source = if i < source_lines.len() { // now item.code_snippet
+            //     source_lines[i]
+            // } else {
+            //     "<unknown source>"
+            // };
             
-            // Format the output with colors (using ANSI escape codes)
-            println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;36m[{}]\x1B[0m \x1B[0;32m=> {:?}\x1B[0m", 
-                    line_num, source, id_hex, result);
+            println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;36m[{}]\x1B[0m \x1B[0;32m=> {}\x1B[0m", 
+                    item.line, item.code_snippet, item.id_hex_short, item.value_str);
         }
     }
     
@@ -700,11 +766,20 @@ pub async fn evaluate_form(code: &str, context: &mut IndexMap<String, Value>) ->
 
 // Convert from ExprAst to Node tree
 fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
+    let mut metadata = HashMap::new();
+    
+    // Extract and store line information
+    let span: SourceSpan = match ast {
+        ExprAst::Symbol(_, s) => *s,
+        ExprAst::Number(_, s) => *s,
+        ExprAst::List(_, s) => *s,
+        ExprAst::String(_, s) => *s,
+    };
+    metadata.insert("line".to_string(), span.line.to_string());
+
     match ast {
-        ExprAst::Symbol(s) => {
-            let mut metadata = HashMap::new();
+        ExprAst::Symbol(s, _) => {
             metadata.insert("source_type".to_string(), "symbol".to_string());
-            
             Node::new(
                 NodeKind::Symbol(s.clone()),
                 s.clone(),
@@ -712,10 +787,8 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
                 metadata
             )
         },
-        ExprAst::Number(n) => {
-            let mut metadata = HashMap::new();
+        ExprAst::Number(n, _) => {
             metadata.insert("source_type".to_string(), "number".to_string());
-            
             Node::new(
                 NodeKind::Number(*n),
                 n.to_string(),
@@ -723,11 +796,9 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
                 metadata
             )
         },
-        ExprAst::String(s) => {
-            let mut metadata = HashMap::new();
+        ExprAst::String(s, _) => {
             metadata.insert("source_type".to_string(), "string".to_string());
-            
-            let code_snippet = format!("\"{}\"", s);
+            let code_snippet = format!("\"{}\"", s); // Keep string quoted in snippet
             Node::new(
                 NodeKind::String(s.clone()),
                 code_snippet,
@@ -735,11 +806,9 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
                 metadata
             )
         },
-        ExprAst::List(items) => {
+        ExprAst::List(items, _list_span) => {
             if items.is_empty() {
-                let mut metadata = HashMap::new();
                 metadata.insert("source_type".to_string(), "empty_list".to_string());
-                
                 return Node::new(
                     NodeKind::List,
                     "()".to_string(),
@@ -752,8 +821,7 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
             let children: Vec<Rc<Node>> = items.iter().map(ast_to_node_tree).collect();
             
             // Determine the operation type from the first item if it's a symbol
-            if let ExprAst::Symbol(op) = &items[0] {
-                let mut metadata = HashMap::new();
+            if let ExprAst::Symbol(op, _op_span) = &items[0] {
                 let node_kind = match op.as_str() {
                     "def" => {
                         metadata.insert("source_type".to_string(), "definition".to_string());
@@ -795,8 +863,12 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
                     "({})", 
                     items.iter()
                          .map(|item| match item {
-                             ExprAst::String(s) => format!("\"{}\"", s),
-                             _ => format!("{:?}", item).replace("ExprAst::", "")
+                             ExprAst::String(s, _) => format!("\"{}\"", s),
+                             _ => format!("{:?}", item)
+                                 .split('(').nth(0).unwrap_or("").to_lowercase()
+                                 .replace("symbol", &item_to_source_string(item))
+                                 .replace("number", &item_to_source_string(item))
+                                 .replace("list", &item_to_source_string(item))
                          })
                          .collect::<Vec<_>>()
                          .join(" ")
@@ -805,20 +877,30 @@ fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
                 Node::new(node_kind, code_snippet, children, metadata)
             } else {
                 // Generic list
-                let mut metadata = HashMap::new();
                 metadata.insert("source_type".to_string(), "list".to_string());
                 
-                // Reconstruct source code
                 let code_snippet = format!(
                     "({})", 
                     items.iter()
-                         .map(|item| format!("{:?}", item).replace("ExprAst::", ""))
+                         .map(|item| item_to_source_string(item))
                          .collect::<Vec<_>>()
                          .join(" ")
                 );
                 
                 Node::new(NodeKind::List, code_snippet, children, metadata)
             }
+        }
+    }
+}
+
+// Helper function to convert ExprAst back to a string representation for code snippets
+fn item_to_source_string(item: &ExprAst) -> String {
+    match item {
+        ExprAst::Symbol(s, _) => s.clone(),
+        ExprAst::Number(n, _) => n.to_string(),
+        ExprAst::String(s, _) => format!("\"{}\"", s),
+        ExprAst::List(items, _) => {
+            format!("({})", items.iter().map(item_to_source_string).collect::<Vec<_>>().join(" "))
         }
     }
 }
