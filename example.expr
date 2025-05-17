@@ -1,6 +1,6 @@
-(def x 3)
+(def x 4)
 (def y 30)
-(+ x y 3)
+(+ x y 4)
 (* x 3)
 
 (def z (* x y))
