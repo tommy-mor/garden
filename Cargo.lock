@@ -398,6 +398,7 @@ dependencies = [
  "serde_bencode",
  "serde_bytes",
  "serde_json",
+ "smallvec",
  "tokio",
  "uuid",
 ]

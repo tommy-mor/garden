@@ -9,6 +9,7 @@ use notify::{Watcher, RecursiveMode, recommended_watcher};
 use chrono::{self, DateTime, Utc};
 use blake3;
 use hex;
+use smallvec::SmallVec;
 
 // === Import chrono with serde features ===
 #[cfg(feature = "serde")]
@@ -249,6 +250,145 @@ struct CachedValue {
     timestamp: DateTime<Utc>,
 }
 
+// Dependency graph to track relationships between nodes and optimize re-evaluation
+#[derive(Debug, Default)]
+struct DepDag {
+    /// parent -> { children }
+    forward: HashMap<NodeId, SmallVec<[NodeId; 4]>>,
+    /// child -> { parents }
+    reverse: HashMap<NodeId, SmallVec<[NodeId; 4]>>,
+}
+
+impl DepDag {
+    pub fn new() -> Self {
+        Self {
+            forward: HashMap::new(),
+            reverse: HashMap::new(),
+        }
+    }
+
+    // Record a dependency between parent and child
+    pub fn add_dependency(&mut self, parent: NodeId, child: NodeId) {
+        // Skip self-dependencies
+        if parent == child {
+            return;
+        }
+
+        // Check for cycles
+        if self.would_create_cycle(parent, child) {
+            // Just skip creating this dependency - we could log a warning here
+            return;
+        }
+
+        self.forward.entry(parent).or_default().push(child);
+        self.reverse.entry(child).or_default().push(parent);
+    }
+
+    // Check if adding this dependency would create a cycle
+    fn would_create_cycle(&self, parent: NodeId, child: NodeId) -> bool {
+        // Simple case: direct cycle
+        if parent == child {
+            return true;
+        }
+        
+        // Check for indirect cycles by walking the reverse graph from parent
+        // If we can reach child, adding child->parent would create a cycle
+        let mut visited = HashSet::new();
+        let mut stack = vec![parent];
+        
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            
+            if let Some(parents) = self.reverse.get(&node) {
+                for &parent_of_node in parents {
+                    if parent_of_node == child {
+                        return true;
+                    }
+                    stack.push(parent_of_node);
+                }
+            }
+        }
+        
+        false
+    }
+
+    // Mark a node and all its dependents (parents) as dirty
+    pub fn mark_dirty(&self, changed: NodeId, dirty: &mut HashSet<NodeId>) {
+        let mut stack = vec![changed];
+        while let Some(id) = stack.pop() {
+            if dirty.insert(id) {
+                if let Some(parents) = self.reverse.get(&id) {
+                    stack.extend(parents.iter().cloned());
+                }
+            }
+        }
+    }
+
+    // Get all nodes in topological order for evaluation
+    pub fn topological_sort(&self, dirty_nodes: &HashSet<NodeId>) -> Vec<NodeId> {
+        let mut result = Vec::new();
+        let mut in_degree = HashMap::new();
+        let mut queue = Vec::new();
+        
+        // Initialize in-degree counts for all dirty nodes
+        for &node_id in dirty_nodes {
+            // Only process nodes that are in the dependency graph
+            if self.forward.contains_key(&node_id) || self.reverse.contains_key(&node_id) {
+                let degree = self.forward
+                    .iter()
+                    .filter_map(|(_, children)| {
+                        if children.contains(&node_id) && dirty_nodes.contains(children.first().unwrap()) {
+                            Some(1)
+                        } else {
+                            None
+                        }
+                    })
+                    .sum::<usize>();
+                
+                in_degree.insert(node_id, degree);
+                
+                // If this node has no dependencies among dirty nodes, add it to the queue
+                if degree == 0 {
+                    queue.push(node_id);
+                }
+            } else {
+                // Node not in the dependency graph, can be evaluated immediately
+                queue.push(node_id);
+            }
+        }
+        
+        // Process queue
+        while let Some(node_id) = queue.pop() {
+            result.push(node_id);
+            
+            // Decrease in-degree for all children
+            if let Some(children) = self.forward.get(&node_id) {
+                for &child in children {
+                    if dirty_nodes.contains(&child) {
+                        if let Some(degree) = in_degree.get_mut(&child) {
+                            *degree -= 1;
+                            if *degree == 0 {
+                                queue.push(child);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Return the sorted nodes
+        result
+    }
+
+    // Clear the dependency graph
+    pub fn clear(&mut self) {
+        self.forward.clear();
+        self.reverse.clear();
+    }
+}
+
 // The unified evaluation cache
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct EvaluationCache {
@@ -414,12 +554,16 @@ type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 #[derive(Debug)]
 pub struct Evaluator {
     cache: EvaluationCache,
+    depdag: DepDag,
+    dirty_nodes: HashSet<NodeId>,
 }
 
 impl Evaluator {
     pub fn new() -> Self {
         Self {
             cache: EvaluationCache::new(),
+            depdag: DepDag::new(),
+            dirty_nodes: HashSet::new(),
         }
     }
     
@@ -446,6 +590,13 @@ impl Evaluator {
     // Prepare for a new evaluation cycle
     pub fn prepare_for_evaluation(&mut self) {
         self.cache.prepare_for_evaluation();
+        self.dirty_nodes.clear();
+        self.depdag.clear();
+    }
+    
+    // Mark a node and all its dependents as dirty
+    pub fn mark_dirty(&mut self, node_id: NodeId) {
+        self.depdag.mark_dirty(node_id, &mut self.dirty_nodes);
     }
     
     // Get a list of all nodes that changed in the last evaluation cycle
@@ -480,6 +631,9 @@ impl Evaluator {
             if let NodeKind::Symbol(name) = node.kind() {
                 let result = match env.resolve(name) {
                     Some(defining_node_id) => {
+                        // Record the dependency between the symbol node and its defining node
+                        self.depdag.add_dependency(node_id, defining_node_id);
+                        
                         match self.get_node(&defining_node_id) {
                             Some(defining_node) => self.eval_node(&defining_node, env).await,
                             None => Err(Error::EvalError(format!("Internal error: Symbol {} resolved to unknown node", name)))
@@ -523,6 +677,10 @@ impl Evaluator {
 
                     // Arg 2 (child 2) is the value expression
                     let value_expr_node = &node.children()[2];
+                    
+                    // Record dependency to the value expression
+                    self.depdag.add_dependency(node_id, *value_expr_node.id());
+                    
                     let value = self.eval_node(value_expr_node, env).await?;
                     
                     // Update the environment with this binding
@@ -555,7 +713,9 @@ impl Evaluator {
                     // Arg 2 (child 2) is the value expression
                     let value_expr_node = &node.children()[2];
                     
-                    // Evaluate the value expression in the current environment
+                    // Record dependency to value expression
+                    self.depdag.add_dependency(node_id, *value_expr_node.id());
+                    
                     let value = self.eval_node(value_expr_node, env).await?;
                     
                     // Create a new environment extending the current one with the new binding
@@ -565,11 +725,20 @@ impl Evaluator {
                     
                     // Evaluate the body expression in the new environment
                     let body_expr_node = &node.children()[3];
+                    
+                    // Record dependency to body expression
+                    self.depdag.add_dependency(node_id, *body_expr_node.id());
+                    
                     let body_result = self.eval_node(body_expr_node, &new_env).await?;
                     
                     Ok(body_result)
                 },
                 NodeKind::LetStatement => {
+                    // Record dependencies to children
+                    for child in node.children().iter().skip(1) {
+                        self.depdag.add_dependency(node_id, *child.id());
+                    }
+                    
                     // Let statement (let name value)
                     // Children: 0: 'let' symbol, 1: name symbol, 2: value expression
                     if node.children().len() != 3 {
@@ -579,7 +748,6 @@ impl Evaluator {
                         )));
                     }
                     
-                    // Arg 1 (child 1) is the variable name symbol
                     let var_name_node = &node.children()[1];
                     if let NodeKind::Symbol(_) = var_name_node.kind() {
                         // We don't actually bind anything here - that's done by evaluate_sequence
@@ -590,17 +758,20 @@ impl Evaluator {
                         ));
                     };
 
-                    // Arg 2 (child 2) is the value expression
                     let value_expr_node = &node.children()[2];
                     let value = self.eval_node(value_expr_node, env).await?;
                     
-                    // LetStatement evaluates to the value assigned
                     Ok(value)
                 },
                 NodeKind::Addition => {
                     // Addition (+ a b c ...)
                     if node.children().len() < 2 {
                         return Err(Error::EvalError("'+' requires at least 1 argument".to_string()));
+                    }
+                    
+                    // Record dependencies to all arguments
+                    for child in node.children().iter().skip(1) {
+                        self.depdag.add_dependency(node_id, *child.id());
                     }
                     
                     let mut sum = 0;
@@ -621,6 +792,11 @@ impl Evaluator {
                     // Multiplication (* a b c ...)
                     if node.children().len() < 2 {
                         return Err(Error::EvalError("'*' requires at least 1 argument".to_string()));
+                    }
+                    
+                    // Record dependencies to all arguments
+                    for child in node.children().iter().skip(1) {
+                        self.depdag.add_dependency(node_id, *child.id());
                     }
                     
                     let mut product = 1;
@@ -646,8 +822,10 @@ impl Evaluator {
                         ));
                     }
                     
-                    // Evaluate the URL argument node (child 1)
+                    // Record dependency to URL argument
                     let url_expr_node = &node.children()[1];
+                    self.depdag.add_dependency(node_id, *url_expr_node.id());
+                    
                     match self.eval_node(url_expr_node, env).await? {
                         Value::String(url) => {
                             // Perform the HTTP GET request
@@ -668,8 +846,10 @@ impl Evaluator {
                         ));
                     }
                     
-                    // Evaluate the string argument node (child 1)
+                    // Record dependency to string argument
                     let string_expr_node = &node.children()[1];
+                    self.depdag.add_dependency(node_id, *string_expr_node.id());
+                    
                     match self.eval_node(string_expr_node, env).await? {
                         Value::String(s) => {
                             let json_data: JsonValue = serde_json::from_str(&s)?;
@@ -689,12 +869,13 @@ impl Evaluator {
                         ));
                     }
                     
-                    // Evaluate the JSON object argument (child 1)
+                    // Record dependencies to JSON object and key arguments
                     let json_obj_expr_node = &node.children()[1];
-                    let json_val = self.eval_node(json_obj_expr_node, env).await?;
-                    
-                    // Evaluate the key string argument (child 2)
                     let key_string_expr_node = &node.children()[2];
+                    self.depdag.add_dependency(node_id, *json_obj_expr_node.id());
+                    self.depdag.add_dependency(node_id, *key_string_expr_node.id());
+                    
+                    let json_val = self.eval_node(json_obj_expr_node, env).await?;
                     let key_val = self.eval_node(key_string_expr_node, env).await?;
                     
                     match (json_val, key_val) {
@@ -726,8 +907,10 @@ impl Evaluator {
                         ));
                     }
                     
-                    // Evaluate the string argument (child 1)
+                    // Record dependency to string argument
                     let string_expr_node = &node.children()[1];
+                    self.depdag.add_dependency(node_id, *string_expr_node.id());
+                    
                     match self.eval_node(string_expr_node, env).await? {
                         Value::String(s) => Ok(Value::String(s.to_uppercase())),
                         other_type => Err(Error::EvalError(format!(
@@ -740,6 +923,11 @@ impl Evaluator {
                     // Generic list or unknown function call
                     if node.children().is_empty() {
                         return Err(Error::EvalError("Cannot evaluate an empty list".to_string()));
+                    }
+                    
+                    // Record dependencies to all children
+                    for child in node.children() {
+                        self.depdag.add_dependency(node_id, *child.id());
                     }
                     
                     // The first child of a List node (if not a special form handled above)
@@ -812,6 +1000,28 @@ impl Evaluator {
         }
         
         Ok(last_value)
+    }
+    
+    // Evaluate only dirty nodes in the proper order
+    pub async fn evaluate_dirty_nodes<'a>(
+        &'a mut self,
+        env: &'a mut Env<'a>,
+    ) -> Result<(), Error> {
+        // Get the set of dirty nodes
+        let dirty_node_ids = self.dirty_nodes.clone();
+        
+        // Get the nodes in topological order
+        let sorted_node_ids = self.depdag.topological_sort(&dirty_node_ids);
+        
+        // Evaluate each node in order
+        for node_id in sorted_node_ids {
+            if let Some(node) = self.get_node(&node_id) {
+                let _result = self.eval_node(&node, env).await;
+                // We don't need to do anything with the result here - it's already cached
+            }
+        }
+        
+        Ok(())
     }
 }
 
@@ -924,7 +1134,6 @@ async fn run_once(path: &Path, evaluator: &mut Evaluator) -> Result<(), Box<dyn 
     let src = fs::read_to_string(path)?;
     
     // Parse the source file into a vector of root nodes
-    // Use the parse function directly as it now returns nodes
     let root_nodes = parser::parse(&src)?;
     
     // Create a top-level environment
@@ -935,9 +1144,22 @@ async fn run_once(path: &Path, evaluator: &mut Evaluator) -> Result<(), Box<dyn 
         evaluator.store_node(node.clone());
     }
     
-    // Evaluate the sequence of root nodes, updating env for definitions and let statements
+    // First, evaluate the sequence of root nodes to build up the dependency graph
     if let Err(e) = evaluator.evaluate_sequence(&root_nodes, &mut env).await {
         eprintln!("Evaluation error: {}", e);
+    } else {
+        // Now mark all changed nodes as dirty
+        for node in &root_nodes {
+            evaluator.mark_dirty(*node.id());
+        }
+        
+        // Create a new environment for the second evaluation pass
+        let mut new_env = Env::new();
+        
+        // Evaluate dirty nodes
+        if let Err(e) = evaluator.evaluate_dirty_nodes(&mut new_env).await {
+            eprintln!("Evaluation error during incremental update: {}", e);
+        }
     }
     
     // Get all changed nodes for display
