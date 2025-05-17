@@ -129,12 +129,24 @@ fn parse_expr(pair: Pair<Rule>, source: &str) -> Result<Rc<Node>, Error> {
                 if let NodeKind::Symbol(op) = &first_child.kind {
                     let node_kind = match op.as_str() {
                         "def" => {
-                            metadata.insert("source_type".to_string(), "definition".to_string());
-                            NodeKind::Definition
+                            metadata.insert("source_type".to_string(), "let_statement".to_string());
+                            NodeKind::LetStatement
                         },
                         "let" => {
-                            metadata.insert("source_type".to_string(), "let".to_string());
-                            NodeKind::Let
+                            // Determine if this is a let statement or expression based on the number of children
+                            // (let name value) -> LetStatement
+                            // (let name value body) -> LetExpr
+                            if children.len() == 3 {
+                                metadata.insert("source_type".to_string(), "let_statement".to_string());
+                                NodeKind::LetStatement
+                            } else if children.len() == 4 {
+                                metadata.insert("source_type".to_string(), "let_expr".to_string());
+                                NodeKind::LetExpr
+                            } else {
+                                // Default to LetExpr for backward compatibility
+                                metadata.insert("source_type".to_string(), "let_expr".to_string());
+                                NodeKind::LetExpr
+                            }
                         },
                         "+" => {
                             metadata.insert("source_type".to_string(), "addition".to_string());

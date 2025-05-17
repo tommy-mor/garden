@@ -35,7 +35,8 @@ pub enum NodeKind {
     List,
     // More specific operations
     Definition,
-    Let,
+    LetExpr,        // Changed from Let: (let name value body) - expression form
+    LetStatement,   // New: (let name value) - statement form, modifies current env
     Addition,
     Multiplication,
     HttpGet,
@@ -98,8 +99,11 @@ impl Node {
             NodeKind::Definition => {
                 hasher.update(b"Definition");
             }
-            NodeKind::Let => {
-                hasher.update(b"Let");
+            NodeKind::LetExpr => {
+                hasher.update(b"LetExpr");
+            }
+            NodeKind::LetStatement => {
+                hasher.update(b"LetStatement");
             }
             NodeKind::Addition => {
                 hasher.update(b"Addition");
@@ -528,7 +532,7 @@ impl Evaluator {
                     // 'def' itself evaluates to the value assigned
                     Ok(value)
                 },
-                NodeKind::Let => {
+                NodeKind::LetExpr => {
                     // Let binding (let name value body)
                     // Children: 0: 'let' symbol, 1: name symbol, 2: value expression, 3: body expression
                     if node.children().len() != 4 {
@@ -564,6 +568,34 @@ impl Evaluator {
                     let body_result = self.eval_node(body_expr_node, &new_env).await?;
                     
                     Ok(body_result)
+                },
+                NodeKind::LetStatement => {
+                    // Let statement (let name value)
+                    // Children: 0: 'let' symbol, 1: name symbol, 2: value expression
+                    if node.children().len() != 3 {
+                        return Err(Error::EvalError(format!(
+                            "'let' statement expects 2 arguments (name, value), got {} arguments",
+                            node.children().len() - 1
+                        )));
+                    }
+                    
+                    // Arg 1 (child 1) is the variable name symbol
+                    let var_name_node = &node.children()[1];
+                    if let NodeKind::Symbol(_) = var_name_node.kind() {
+                        // We don't actually bind anything here - that's done by evaluate_sequence
+                        // We just validate the structure and evaluate the value
+                    } else {
+                        return Err(Error::EvalError(
+                            "'let' statement first argument must be a symbol representing the variable name".to_string(),
+                        ));
+                    };
+
+                    // Arg 2 (child 2) is the value expression
+                    let value_expr_node = &node.children()[2];
+                    let value = self.eval_node(value_expr_node, env).await?;
+                    
+                    // LetStatement evaluates to the value assigned
+                    Ok(value)
                 },
                 NodeKind::Addition => {
                     // Addition (+ a b c ...)
@@ -739,6 +771,48 @@ impl Evaluator {
             result
         })
     }
+
+    // Evaluate a sequence of nodes in order, updating the environment for definitions and let statements
+    pub async fn evaluate_sequence<'a>(
+        &'a mut self,
+        nodes: &'a [Rc<Node>],
+        env: &'a mut Env<'a>,
+    ) -> Result<Option<Value>, Error> {
+        let mut last_value = None;
+
+        for node in nodes {
+            let node_id = *node.id();
+            let result = self.eval_node(node, env).await;
+            
+            // For Definition and LetStatement nodes, also update the environment
+            match node.kind() {
+                NodeKind::Definition | NodeKind::LetStatement => {
+                    if node.children().len() >= 3 {
+                        if let NodeKind::Symbol(name) = node.children()[1].kind() {
+                            if result.is_ok() {
+                                // Bind the name to the value expression NodeId for future lookups
+                                env.bind(name, *node.children()[2].id());
+                            }
+                        }
+                    }
+                },
+                _ => {} // Other node types don't modify the environment
+            }
+            
+            // Remember the result of this node
+            if let Ok(value) = &result {
+                last_value = Some(value.clone());
+            }
+            
+            // If there was an error and it hasn't been inserted into the cache yet, insert it
+            if let Err(err) = &result {
+                self.cache.insert(node_id, Err(err.clone()));
+                return Err(err.clone());
+            }
+        }
+        
+        Ok(last_value)
+    }
 }
 
 pub fn convert_json_value(json_val: JsonValue) -> Result<Value, Error> {
@@ -861,21 +935,9 @@ async fn run_once(path: &Path, evaluator: &mut Evaluator) -> Result<(), Box<dyn 
         evaluator.store_node(node.clone());
     }
     
-    // Evaluate each root node
-    for root_node in &root_nodes {
-        // Evaluate the node
-        if let Err(e) = evaluator.eval_node(root_node, &env).await {
-            eprintln!("Note: Expression resulted in an error: {}. Code: {}", e, root_node.code_snippet());
-        }
-        
-        // If this was a definition, update the top-level environment
-        if let NodeKind::Definition = root_node.kind() {
-            if root_node.children().len() == 3 {
-                if let NodeKind::Symbol(name) = root_node.children()[1].kind() {
-                    env.bind(name, *root_node.children()[2].id());
-                }
-            }
-        }
+    // Evaluate the sequence of root nodes, updating env for definitions and let statements
+    if let Err(e) = evaluator.evaluate_sequence(&root_nodes, &mut env).await {
+        eprintln!("Evaluation error: {}", e);
     }
     
     // Get all changed nodes for display

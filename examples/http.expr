@@ -1,11 +1,13 @@
-(let url "https://catfact.ninja/fact")
+(def url "https://catfact.ninja/fact")
 
 
-(let raw (http.get url))
+(def raw (http.get url))
 
-(let json (json.parse raw))
+(def json (json.parse raw))
 
 
-(let fact (get json "fact"))
+(def fact (get json "fact"))
 
-(let fact_upper (str.upper fact))
+(def fact_upper (str.upper fact))
+
+(str.upper (get (json.parse (http.get "https://catfact.ninja/fact")) "fact"))
