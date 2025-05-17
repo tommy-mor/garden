@@ -161,7 +161,7 @@ pub enum Value {
     Json(JsonValue),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Error {
     ParseError(String),
     EvalError(String),
@@ -220,9 +220,9 @@ impl ValueCache {
         let json = fs::read_to_string(path)?;
         self.values = serde_json::from_str(&json)?;
         
-        let now = chrono::Utc::now().to_rfc3339();
+        let now_str = chrono::Utc::now().to_rfc3339();
         for key in self.values.keys() {
-            self.last_update.insert(key.clone(), now.clone());
+            self.last_update.insert(key.clone(), now_str.clone());
         }
         Ok(())
     }
@@ -559,24 +559,161 @@ impl From<serde_json::Error> for Error {
 type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 // NodeCache manages caching of evaluated values by node ID
-#[derive(Debug, Default)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeCache {
+    #[serde(serialize_with = "node_id_map_serde::serialize_result_values_map", 
+            deserialize_with = "node_id_map_serde::deserialize_result_values_map")]
     values: HashMap<NodeId, Result<Value, Error>>,
+    
+    #[serde(serialize_with = "node_id_map_serde::serialize_node_id_string_map",
+            deserialize_with = "node_id_map_serde::deserialize_node_id_string_map")]
     last_update: HashMap<NodeId, String>, // ISO timestamp
-    changed_nodes: std::collections::HashSet<NodeId>, // Tracks nodes changed in current run
-    previously_seen: std::collections::HashSet<NodeId>, // Tracks all nodes seen before the current run
+    
+    #[serde(serialize_with = "node_id_map_serde::serialize_string_node_id_set_map",
+            deserialize_with = "node_id_map_serde::deserialize_string_node_id_set_map")]
     dependencies: HashMap<String, std::collections::HashSet<NodeId>>, // Maps symbol names to nodes that depend on them
+
+    #[serde(skip)] // Transient fields, not serialized
+    changed_nodes: std::collections::HashSet<NodeId>,
+    #[serde(skip)]
+    previously_seen: std::collections::HashSet<NodeId>,
+}
+
+// Serde helper module for NodeId maps
+mod node_id_map_serde {
+    use serde::{
+        de::Error as SerdeError, ser::SerializeMap, Deserializer, Serializer,
+        Serialize, Deserialize
+    };
+    use std::collections::HashMap;
+    use crate::{NodeId, Value, Error as EvalError};
+    use hex;
+
+    // For HashMap<NodeId, Result<Value, EvalError>> (values field)
+    pub fn serialize_result_values_map<S>(
+        map: &HashMap<NodeId, Result<Value, EvalError>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut smap = serializer.serialize_map(Some(map.len()))?;
+        for (k, v_res) in map {
+            let k_hex = hex::encode(k);
+            let v_str = match v_res {
+                Ok(val) => serde_json::to_string(val).map_err(serde::ser::Error::custom)?,
+                Err(err) => format!("Error: {}", err),
+            };
+            smap.serialize_entry(&k_hex, &v_str)?;
+        }
+        smap.end()
+    }
+
+    pub fn deserialize_result_values_map<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<NodeId, Result<Value, EvalError>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string_map = HashMap::<String, String>::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for (k_hex, v_str) in string_map {
+            let mut node_id = [0u8; 32];
+            hex::decode_to_slice(&k_hex, &mut node_id).map_err(SerdeError::custom)?;
+            if let Ok(val) = serde_json::from_str::<Value>(&v_str) {
+                map.insert(node_id, Ok(val));
+            } else {
+                // Assuming it's an error string if not a Value
+                map.insert(node_id, Err(EvalError::EvalError(v_str.trim_start_matches("Error: ").to_string())));
+            }
+        }
+        Ok(map)
+    }
+
+    // For HashMap<NodeId, String> (last_update field)
+    pub fn serialize_node_id_string_map<S>(
+        map: &HashMap<NodeId, String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut smap = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            smap.serialize_entry(&hex::encode(k), v)?;
+        }
+        smap.end()
+    }
+
+    pub fn deserialize_node_id_string_map<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<NodeId, String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string_map = HashMap::<String, String>::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for (k_hex, v) in string_map {
+            let mut node_id = [0u8; 32];
+            hex::decode_to_slice(&k_hex, &mut node_id).map_err(SerdeError::custom)?;
+            map.insert(node_id, v);
+        }
+        Ok(map)
+    }
+
+    // For HashMap<String, HashSet<NodeId>> (dependencies field)
+    pub fn serialize_string_node_id_set_map<S>(
+        map: &HashMap<String, std::collections::HashSet<NodeId>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut smap = serializer.serialize_map(Some(map.len()))?;
+        for (k_str, v_set) in map {
+            let v_hex_vec: Vec<String> = v_set.iter().map(hex::encode).collect();
+            smap.serialize_entry(k_str, &v_hex_vec)?;
+        }
+        smap.end()
+    }
+
+    pub fn deserialize_string_node_id_set_map<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<String, std::collections::HashSet<NodeId>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string_map = HashMap::<String, Vec<String>>::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for (k_str, v_hex_vec) in string_map {
+            let mut node_id_set = std::collections::HashSet::new();
+            for id_hex in v_hex_vec {
+                let mut node_id = [0u8; 32];
+                hex::decode_to_slice(&id_hex, &mut node_id).map_err(SerdeError::custom)?;
+                node_id_set.insert(node_id);
+            }
+            map.insert(k_str, node_id_set);
+        }
+        Ok(map)
+    }
+}
+
+impl Default for NodeCache {
+    fn default() -> Self {
+        NodeCache {
+            values: HashMap::new(),
+            last_update: HashMap::new(),
+            changed_nodes: std::collections::HashSet::new(), // Initialized empty
+            previously_seen: std::collections::HashSet::new(), // Initialized empty
+            dependencies: HashMap::new(),
+        }
+    }
 }
 
 impl NodeCache {
     pub fn new() -> Self {
-        Self {
-            values: HashMap::new(),
-            last_update: HashMap::new(),
-            changed_nodes: std::collections::HashSet::new(),
-            previously_seen: std::collections::HashSet::new(),
-            dependencies: HashMap::new(),
-        }
+        Self::default()
     }
     
     pub fn get(&self, id: &NodeId) -> Option<&Result<Value, Error>> {
@@ -584,12 +721,8 @@ impl NodeCache {
     }
     
     pub fn insert(&mut self, id: NodeId, value: Result<Value, Error>) {
-        // A node is considered changed if:
-        // 1. It didn't exist before OR
-        // 2. Its value is different from the previous value
         let is_changed = match self.values.get(&id) {
             Some(old_value) => {
-                // Compare the string representation of the values
                 let old_str = format!("{:?}", old_value);
                 let new_str = format!("{:?}", &value);
                 old_str != new_str
@@ -598,19 +731,13 @@ impl NodeCache {
         };
         
         if is_changed {
-            // Track this node as changed
             self.changed_nodes.insert(id);
-            
-            // Update the value and timestamp
             let now = chrono::Utc::now().to_rfc3339();
             self.last_update.insert(id, now);
         }
-        
-        // Always update the value, even if it hasn't changed
         self.values.insert(id, value);
     }
     
-    // Record that a node depends on a symbol
     pub fn add_dependency(&mut self, symbol_name: &str, node_id: NodeId) {
         self.dependencies
             .entry(symbol_name.to_string())
@@ -618,7 +745,6 @@ impl NodeCache {
             .insert(node_id);
     }
     
-    // Mark nodes that depend on a symbol as changed
     pub fn mark_dependents_changed(&mut self, symbol_name: &str) {
         if let Some(dependent_nodes) = self.dependencies.get(symbol_name) {
             for &node_id in dependent_nodes.iter() {
@@ -627,80 +753,54 @@ impl NodeCache {
         }
     }
     
-    // Check if a node was changed in the current cycle
     pub fn was_changed(&self, id: &NodeId) -> bool {
         self.changed_nodes.contains(id)
     }
     
-    // Manually mark a node as changed
     pub fn mark_changed(&mut self, id: NodeId) {
         self.changed_nodes.insert(id);
     }
     
-    // Before starting a new evaluation cycle, snapshot the current state
     pub fn prepare_for_evaluation(&mut self) {
         self.changed_nodes.clear();
-        
-        // Keep track of all nodes we've seen before
+        self.previously_seen.clear();
         for id in self.values.keys() {
             self.previously_seen.insert(*id);
         }
     }
     
-    // Save cache to disk
     pub fn save_to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        // Convert NodeIds to hex strings for JSON serialization
-        let mut serializable_values = HashMap::new();
-        
-        for (id, value) in &self.values {
-            let id_hex = hex::encode(id);
-            
-            // We need to convert Result<Value, Error> to a serializable format
-            let value_str = match value {
-                Ok(v) => serde_json::to_string(v)?,
-                Err(e) => format!("Error: {}", e),
-            };
-            
-            serializable_values.insert(id_hex, value_str);
-        }
-        
-        let json = serde_json::to_string_pretty(&serializable_values)?;
+        let json = serde_json::to_string_pretty(&self)?;
         fs::write(path, json)?;
         Ok(())
     }
     
-    // Load cache from disk
     pub fn load_from_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if !path.exists() {
+            *self = NodeCache::default();
+            return Ok(());
+        }
+        let json_str = fs::read_to_string(path)?;
+        if json_str.trim().is_empty() {
+            *self = NodeCache::default();
             return Ok(());
         }
         
-        let json = fs::read_to_string(path)?;
-        let serializable_values: HashMap<String, String> = serde_json::from_str(&json)?;
-        
-        for (id_hex, value_str) in serializable_values {
-            // Convert hex string back to NodeId
-            let id_bytes = hex::decode(&id_hex)?;
-            if id_bytes.len() != 32 {
-                continue; // Skip invalid entries
+        match serde_json::from_str::<NodeCache>(&json_str) {
+            Ok(loaded_cache) => {
+                *self = loaded_cache;
+                // Ensure transient fields are correctly initialized after load
+                self.changed_nodes = std::collections::HashSet::new();
+                self.previously_seen = std::collections::HashSet::new();
+                for id in self.values.keys() {
+                    self.previously_seen.insert(*id);
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to load node cache, reinitializing: {}", e);
+                *self = NodeCache::default();
             }
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&id_bytes);
-            
-            // Try to parse as Value
-            if let Ok(value) = serde_json::from_str::<Value>(&value_str) {
-                self.values.insert(id, Ok(value));
-                self.previously_seen.insert(id);
-            } else {
-                // It's an error string, store as error
-                self.values.insert(id, Err(Error::EvalError(value_str.trim_start_matches("Error: ").to_string())));
-                self.previously_seen.insert(id);
-            }
-            
-            // Set timestamp to now
-            self.last_update.insert(id, chrono::Utc::now().to_rfc3339());
         }
-        
         Ok(())
     }
 }
@@ -712,20 +812,18 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
         // Get the node ID for easy reference
         let node_id = node.id;
         
-        // Check if node is changed or if it's a symbol (which needs to be re-evaluated)
-        if !matches!(&node.kind, NodeKind::Symbol(_)) {
-            // For non-symbol nodes, check if they're marked as changed
-            if !cache.was_changed(&node_id) {
-                if let Some(cached_value) = cache.get(&node_id) {
-                    return cached_value.clone();
-                }
+        // Check if the node is already marked as changed, or if it's a symbol (which might have new values)
+        // For non-symbol nodes, check if they're marked as changed
+        if !matches!(&node.kind, NodeKind::Symbol(_)) && !cache.was_changed(&node_id) {
+            if let Some(cached_value) = cache.get(&node_id) {
+                return cached_value.clone();
             }
         }
         
         // Evaluate this node based on its kind
         let result = match &node.kind {
             NodeKind::Symbol(name) => {
-                // Add this node as a dependency of the symbol
+                // Record dependency BEFORE lookup to avoid borrowing issues
                 cache.add_dependency(name, node_id);
                 
                 // Look up the symbol in the context
@@ -775,11 +873,7 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
                 
                 // If the value changed, mark all nodes that depend on this symbol as changed
                 if old_value.is_none() || old_value.as_ref() != Some(&value) {
-                    // This will cascade and mark all nodes that depend on this symbol as changed
                     cache.mark_dependents_changed(&var_name);
-                    
-                    // Also record the dependency for future tracking
-                    cache.add_dependency(&var_name, node_id);
                 }
                 
                 // 'def' itself evaluates to the value assigned
@@ -795,6 +889,12 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
                 // Evaluate argument children (starting from index 1)
                 for i in 1..node.children.len() {
                     let arg_node = &node.children[i];
+                    
+                    // Record dependency if it's a symbol
+                    if let NodeKind::Symbol(name) = &arg_node.kind {
+                        cache.add_dependency(name, node_id);
+                    }
+                    
                     let val = eval_node(arg_node, context, cache).await?;
                     match val {
                         Value::Number(n) => sum += n,
@@ -815,6 +915,12 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
                 // Evaluate argument children (starting from index 1)
                 for i in 1..node.children.len() {
                     let arg_node = &node.children[i];
+                    
+                    // Record dependency if it's a symbol
+                    if let NodeKind::Symbol(name) = &arg_node.kind {
+                        cache.add_dependency(name, node_id);
+                    }
+                    
                     let val = eval_node(arg_node, context, cache).await?;
                     match val {
                         Value::Number(n) => product *= n,
