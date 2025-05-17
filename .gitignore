@@ -6,5 +6,4 @@ all.txt
 
 /target
 
-*.expr.nodecache
-*.expr.value
+*.expr.cache

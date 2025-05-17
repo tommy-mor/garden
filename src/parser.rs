@@ -14,20 +14,39 @@ pub struct ExprParser;
 // Main parsing function that returns a vector of Nodes
 pub fn parse(source: &str) -> Result<Vec<Rc<Node>>, Error> {
     // Parse the input using pest
-    let pairs = ExprParser::parse(Rule::program, source)
+    let top_level_pairs = ExprParser::parse(Rule::program, source)
         .map_err(|e| Error::ParseError(e.to_string()))?;
     
     // Process all top-level expressions into nodes
     let mut nodes = Vec::new();
     
-    for pair in pairs {
-        match pair.as_rule() {
-            Rule::expr => {
-                let node = parse_expr(pair, source)?;
-                nodes.push(node);
+    for program_level_pair in top_level_pairs { // This iterates once for the Rule::program match
+        if program_level_pair.as_rule() == Rule::program {
+            for pair in program_level_pair.into_inner() { // Iterate over SOI, (symbol|number|string|list)*, EOI
+                match pair.as_rule() {
+                    // Since `expr` is a silent rule `_{...}`, `pair.as_rule()` here will directly be
+                    // `Rule::symbol`, `Rule::number`, `Rule::string`, or `Rule::list` for expressions.
+                    Rule::symbol | Rule::number | Rule::string | Rule::list => {
+                        let node = parse_expr(pair, source)?;
+                        nodes.push(node);
+                    }
+                    Rule::EOI => {
+                        // These are structural tokens from the `program` rule, ignore.
+                    }
+                    _ => {
+                        return Err(Error::ParseError(format!(
+                            "Unexpected rule {:?} inside program structure. Expected expressions (symbol, number, string, list), SOI, or EOI.",
+                            pair.as_rule()
+                        )));
+                    }
+                }
             }
-            Rule::EOI => {}, // End of input, ignore
-            _ => return Err(Error::ParseError(format!("Unexpected rule: {:?}", pair.as_rule()))),
+        } else {
+            // This should not happen if parsing started with Rule::program.
+            return Err(Error::ParseError(format!(
+                "Expected Rule::program as top-level, but got {:?}",
+                program_level_pair.as_rule()
+            )));
         }
     }
     
@@ -88,10 +107,11 @@ fn parse_expr(pair: Pair<Rule>, source: &str) -> Result<Rc<Node>, Error> {
             // Parse inner expressions of the list
             let mut children = Vec::new();
             for inner_pair in pair.into_inner() {
-                if inner_pair.as_rule() == Rule::expr {
-                    let child_node = parse_expr(inner_pair, source)?;
-                    children.push(child_node);
-                }
+                // Since `expr` is silent (`_{...}`), `inner_pair.as_rule()` will directly be
+                // `Rule::symbol`, `Rule::number`, `Rule::string`, or `Rule::list`.
+                // The `parse_expr` function is designed to handle these directly.
+                let child_node = parse_expr(inner_pair, source)?;
+                children.push(child_node);
             }
             
             if children.is_empty() {
@@ -156,11 +176,16 @@ fn parse_expr(pair: Pair<Rule>, source: &str) -> Result<Rc<Node>, Error> {
             Ok(Node::new(NodeKind::List, original_text, children, metadata))
         },
         Rule::expr => {
-            // Recursively process a nested expression
-            let inner = pair.into_inner().next()
-                .ok_or_else(|| Error::ParseError("Empty expression".to_string()))?;
-            parse_expr(inner, source)
+            // This case should ideally be unreachable if 'expr' is a silent rule in the grammar
+            // and `parse_expr` is consistently called with the direct contents of `expr`
+            // (i.e., symbol, number, string, list).
+            // If this branch is hit, it might indicate a misunderstanding of how silent rules
+            // are handled or an inconsistent calling pattern for `parse_expr`.
+            Err(Error::ParseError(format!(
+                "Unexpectedly encountered Rule::expr in parse_expr. This rule is silent and should not appear directly. Inner content: {:?}",
+                pair.into_inner().peekable().peek().map(|p| p.as_rule())
+            )))
         },
-        _ => Err(Error::ParseError(format!("Unexpected rule: {:?}", pair.as_rule()))),
+        _ => Err(Error::ParseError(format!("Unexpected rule in parse_expr: {:?}", pair.as_rule()))),
     }
 } 
