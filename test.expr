@@ -1,0 +1,6 @@
+(def greeting "Hello, world!")
+(def num 42)
+(+ 1 2 3)
+(* 4 5)
+(def result (* (+ 2 3) 4))
+(str.upper greeting) 

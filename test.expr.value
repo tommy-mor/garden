@@ -1,0 +1,11 @@
+{
+  "greeting": {
+    "String": "Hello, world!"
+  },
+  "num": {
+    "Number": 42
+  },
+  "result": {
+    "Number": 20
+  }
+}

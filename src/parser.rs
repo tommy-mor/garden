@@ -1,5 +1,5 @@
 use pest::Parser;
-use pest::iterators::{Pair, Pairs};
+use pest::iterators::Pair;
 use pest_derive::Parser;
 use std::str::FromStr;
 
@@ -56,9 +56,6 @@ fn parse_expr(pair: Pair<Rule>) -> Result<ExprAst, Error> {
         Rule::string => {
             // Process the string, handling escapes
             // The string token includes the outer quotes
-            let raw_str = pair.as_str();
-            // Skip the first and last characters (quotes)
-            let content = &raw_str[1..raw_str.len() - 1];
             
             // Find the inner_string rule
             let inner = pair.into_inner().next()
