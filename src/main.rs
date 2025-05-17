@@ -3,7 +3,6 @@ use serde::{Serialize, Deserialize};
 use serde_json::Value as JsonValue;
 use indexmap::IndexMap;
 use reqwest;
-use std::error::Error as StdError;
 use futures::future::{BoxFuture, Future};
 use std::pin::Pin;
 use notify::{Watcher, RecursiveMode, recommended_watcher};
@@ -18,24 +17,22 @@ mod parser;
 
 // === TYPES ===
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SourceSpan {
-    line: usize,
-    // column: usize, // TODO: Add column later
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSpan {
+    pub line: usize,
+    pub original_text: String, // Store the original source text
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ExprAst {
+pub enum ExprAst {
     Symbol(String, SourceSpan),
     Number(i64, SourceSpan),
     List(Vec<ExprAst>, SourceSpan),
     String(String, SourceSpan),
 }
 
-// Node ID based on content hash
 type NodeId = [u8; 32]; // 32 bytes for BLAKE3 hash
 
-// Kind of node for evaluation purposes
 #[derive(Debug, Clone, PartialEq)]
 enum NodeKind {
     Symbol(String),
@@ -231,167 +228,6 @@ impl ValueCache {
     }
 }
 
-// === Parser ===
-// Use the new pest-based parser module instead of the old parser functions
-
-// === Evaluator ===
-pub fn eval<'a>(ast: &'a ExprAst, context: &'a mut IndexMap<String, Value>) -> BoxFuture<'a, Result<Value, Error>> {
-    Box::pin(async move {
-        match ast {
-            ExprAst::Symbol(s, _) => Ok(context
-                .get(s)
-                .cloned()
-                .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", s)))?),
-            ExprAst::Number(n, _) => Ok(Value::Number(*n)),
-            ExprAst::String(s, _) => Ok(Value::String(s.clone())),
-            ExprAst::List(list, _list_span) => {
-                if list.is_empty() {
-                    return Err(Error::EvalError("Cannot evaluate empty list".to_string()));
-                }
-
-                let op_node = &list[0];
-                let args = &list[1..];
-
-                if let ExprAst::Symbol(op, _op_span) = op_node {
-                    match op.as_str() {
-                        "def" => {
-                            if args.len() != 2 {
-                                return Err(Error::EvalError(format!(
-                                    "'def' expects 2 arguments, got {}",
-                                    args.len()
-                                )));
-                            }
-                            let var_name_node = &args[0];
-                            let value_node = &args[1];
-
-                            if let ExprAst::Symbol(var_name, _var_span) = var_name_node {
-                                let value = eval(value_node, context).await?;
-                                context.insert(var_name.clone(), value.clone());
-                                Ok(value)
-                            } else {
-                                Err(Error::EvalError(
-                                    "'def' first argument must be a symbol".to_string(),
-                                ))
-                            }
-                        }
-                        "+" => {
-                            let mut sum = 0;
-                            for arg_node in args {
-                                let val = eval(arg_node, context).await?;
-                                match val {
-                                    Value::Number(n) => sum += n,
-                                    _ => return Err(Error::EvalError(
-                                        "'+' requires number arguments".to_string(),
-                                    )),
-                                }
-                            }
-                            Ok(Value::Number(sum))
-                        }
-                        "*" => {
-                            let mut product = 1;
-                            for arg_node in args {
-                                let val = eval(arg_node, context).await?;
-                                match val {
-                                    Value::Number(n) => product *= n,
-                                    _ => return Err(Error::EvalError(
-                                        "'*' requires number arguments".to_string(),
-                                    )),
-                                }
-                            }
-                            Ok(Value::Number(product))
-                        }
-                        "http.get" => {
-                            if args.len() != 1 {
-                                return Err(Error::EvalError(
-                                    "'http.get' expects 1 argument (url)".into(),
-                                ));
-                            }
-                            match eval(&args[0], context).await? {
-                                Value::String(url) => {
-                                    let body = reqwest::get(&url).await?.text().await?;
-                                    Ok(Value::String(body))
-                                }
-                                _ => Err(Error::EvalError(
-                                    "'http.get' expects a string argument".into(),
-                                )),
-                            }
-                        }
-                        "json.parse" => {
-                            if args.len() != 1 {
-                                return Err(Error::EvalError(
-                                    "'json.parse' expects 1 argument (string)".into(),
-                                ));
-                            }
-                            match eval(&args[0], context).await? {
-                                Value::String(s) => {
-                                    let json_data: JsonValue = serde_json::from_str(&s)?;
-                                    Ok(Value::Json(json_data))
-                                }
-                                _ => Err(Error::EvalError(
-                                    "'json.parse' expects a string argument".into(),
-                                )),
-                            }
-                        }
-                        "get" => {
-                            if args.len() != 2 {
-                                return Err(Error::EvalError(
-                                    "'get' expects 2 arguments (json, key)".into(),
-                                ));
-                            }
-                            let json_arg = eval(&args[0], context).await?;
-                            let key_arg = eval(&args[1], context).await?;
-
-                            match (&json_arg, &key_arg) {
-                                (Value::Json(json), Value::String(key)) => {
-                                    match json.get(key) {
-                                        Some(v) => convert_json_value(v.clone()),
-                                        None => Err(Error::EvalError(format!(
-                                            "Key '{}' not found in JSON object",
-                                            key
-                                        ))),
-                                    }
-                                }
-                                _ => Err(Error::EvalError(format!(
-                                    "'get' expects (json, string) arguments, got ({:?}, {:?})",
-                                    &json_arg, &key_arg
-                                ))),
-                            }
-                        }
-                        "str.upper" => {
-                            if args.len() != 1 {
-                                return Err(Error::EvalError(
-                                    "'str.upper' expects 1 argument (string)".into(),
-                                ));
-                            }
-                            match eval(&args[0], context).await? {
-                                Value::String(s) => {
-                                    Ok(Value::String(s.to_uppercase()))
-                                }
-                                _ => Err(Error::EvalError(
-                                    "'str.upper' expects a string argument".into(),
-                                )),
-                            }
-                        }
-                        _ => {
-                            Err(Error::EvalError(format!(
-                                "Unknown function symbol '{}' encountered, returning nil.",
-                                op
-                            )))
-                        }
-                    }
-                } else {
-                    Err(Error::EvalError(format!(
-                        "List head must be a function/operator symbol, got: {:?}",
-                        op_node
-                    )))
-                }
-            }
-        }
-    })
-}
-
-// === MAIN ===
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -524,6 +360,113 @@ fn collect_display_info_recursive(
     }
 }
 
+// Convert from ExprAst to Node tree
+fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
+    let mut metadata = HashMap::new();
+    
+    // Extract span info including line and original text
+    let span = match ast {
+        ExprAst::Symbol(_, s) => s,
+        ExprAst::Number(_, s) => s,
+        ExprAst::List(_, s) => s,
+        ExprAst::String(_, s) => s,
+    };
+    
+    // Store line information in metadata
+    metadata.insert("line".to_string(), span.line.to_string());
+
+    match ast {
+        ExprAst::Symbol(s, _) => {
+            metadata.insert("source_type".to_string(), "symbol".to_string());
+            Node::new(
+                NodeKind::Symbol(s.clone()),
+                s.clone(), // Already have symbol name
+                Vec::new(),
+                metadata
+            )
+        },
+        ExprAst::Number(n, _) => {
+            metadata.insert("source_type".to_string(), "number".to_string());
+            Node::new(
+                NodeKind::Number(*n),
+                n.to_string(), // Already have number as string
+                Vec::new(),
+                metadata
+            )
+        },
+        ExprAst::String(s, _) => {
+            metadata.insert("source_type".to_string(), "string".to_string());
+            // Use span's original text which includes quotes
+            Node::new(
+                NodeKind::String(s.clone()),
+                span.original_text.clone(),
+                Vec::new(),
+                metadata
+            )
+        },
+        ExprAst::List(items, _) => {
+            if items.is_empty() {
+                metadata.insert("source_type".to_string(), "empty_list".to_string());
+                return Node::new(
+                    NodeKind::List,
+                    span.original_text.clone(), // Use original text
+                    Vec::new(),
+                    metadata
+                );
+            }
+            
+            // Create child nodes for ALL items including the operator
+            let children: Vec<Rc<Node>> = items.iter().map(ast_to_node_tree).collect();
+            
+            // Determine the operation type from the first item if it's a symbol
+            if let ExprAst::Symbol(op, _) = &items[0] {
+                let node_kind = match op.as_str() {
+                    "def" => {
+                        metadata.insert("source_type".to_string(), "definition".to_string());
+                        NodeKind::Definition
+                    },
+                    "+" => {
+                        metadata.insert("source_type".to_string(), "addition".to_string());
+                        NodeKind::Addition
+                    },
+                    "*" => {
+                        metadata.insert("source_type".to_string(), "multiplication".to_string());
+                        NodeKind::Multiplication
+                    },
+                    "http.get" => {
+                        metadata.insert("source_type".to_string(), "http_get".to_string());
+                        NodeKind::HttpGet
+                    },
+                    "json.parse" => {
+                        metadata.insert("source_type".to_string(), "json_parse".to_string());
+                        NodeKind::JsonParse
+                    },
+                    "get" => {
+                        metadata.insert("source_type".to_string(), "json_get".to_string());
+                        NodeKind::JsonGet
+                    },
+                    "str.upper" => {
+                        metadata.insert("source_type".to_string(), "string_upper".to_string());
+                        NodeKind::StringUpper
+                    },
+                    _ => {
+                        metadata.insert("source_type".to_string(), "function_call".to_string());
+                        metadata.insert("function_name".to_string(), op.clone());
+                        NodeKind::List
+                    }
+                };
+                
+                // Use original source text directly
+                Node::new(node_kind, span.original_text.clone(), children, metadata)
+            } else {
+                // Generic list
+                metadata.insert("source_type".to_string(), "list".to_string());
+                Node::new(NodeKind::List, span.original_text.clone(), children, metadata)
+            }
+        }
+    }
+}
+
 async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache: &mut NodeCache) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nRevaluating expressions in {}...", path.display());
     
@@ -613,179 +556,6 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-pub async fn evaluate_file(file_path: &Path) -> Result<(IndexMap<String, Value>, Option<Value>), Box<dyn std::error::Error>> {
-    let input = fs::read_to_string(file_path)?;
-    // Call the new parser module's parse function
-    let ast_nodes = parser::parse(&input)?;
-
-    let mut context: IndexMap<String, Value> = IndexMap::new();
-    let mut last_result: Option<Value> = None;
-
-    for node in ast_nodes {
-        let value = eval(&node, &mut context).await?;
-        last_result = Some(value);
-    }
-
-    Ok((context, last_result))
-}
-
-pub async fn evaluate_form(code: &str, context: &mut IndexMap<String, Value>) -> Result<Value, Error> {
-    // Call the new parser module's parse function
-    let ast_nodes = parser::parse(code)?;
-    let mut last_result: Option<Value> = None;
-
-    for node in ast_nodes {
-        let value = eval(&node, context).await?;
-        last_result = Some(value);
-    }
-
-    last_result.ok_or_else(|| Error::EvalError("No result found".to_string()))
-}
-
-// === Node Evaluation ===
-
-// Convert from ExprAst to Node tree
-fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
-    let mut metadata = HashMap::new();
-    
-    // Extract and store line information
-    let span: SourceSpan = match ast {
-        ExprAst::Symbol(_, s) => *s,
-        ExprAst::Number(_, s) => *s,
-        ExprAst::List(_, s) => *s,
-        ExprAst::String(_, s) => *s,
-    };
-    metadata.insert("line".to_string(), span.line.to_string());
-
-    match ast {
-        ExprAst::Symbol(s, _) => {
-            metadata.insert("source_type".to_string(), "symbol".to_string());
-            Node::new(
-                NodeKind::Symbol(s.clone()),
-                s.clone(),
-                Vec::new(),
-                metadata
-            )
-        },
-        ExprAst::Number(n, _) => {
-            metadata.insert("source_type".to_string(), "number".to_string());
-            Node::new(
-                NodeKind::Number(*n),
-                n.to_string(),
-                Vec::new(),
-                metadata
-            )
-        },
-        ExprAst::String(s, _) => {
-            metadata.insert("source_type".to_string(), "string".to_string());
-            let code_snippet = format!("\"{}\"", s); // Keep string quoted in snippet
-            Node::new(
-                NodeKind::String(s.clone()),
-                code_snippet,
-                Vec::new(),
-                metadata
-            )
-        },
-        ExprAst::List(items, _list_span) => {
-            if items.is_empty() {
-                metadata.insert("source_type".to_string(), "empty_list".to_string());
-                return Node::new(
-                    NodeKind::List,
-                    "()".to_string(),
-                    Vec::new(),
-                    metadata
-                );
-            }
-            
-            // Create child nodes for ALL items including the operator
-            let children: Vec<Rc<Node>> = items.iter().map(ast_to_node_tree).collect();
-            
-            // Determine the operation type from the first item if it's a symbol
-            if let ExprAst::Symbol(op, _op_span) = &items[0] {
-                let node_kind = match op.as_str() {
-                    "def" => {
-                        metadata.insert("source_type".to_string(), "definition".to_string());
-                        NodeKind::Definition
-                    },
-                    "+" => {
-                        metadata.insert("source_type".to_string(), "addition".to_string());
-                        NodeKind::Addition
-                    },
-                    "*" => {
-                        metadata.insert("source_type".to_string(), "multiplication".to_string());
-                        NodeKind::Multiplication
-                    },
-                    "http.get" => {
-                        metadata.insert("source_type".to_string(), "http_get".to_string());
-                        NodeKind::HttpGet
-                    },
-                    "json.parse" => {
-                        metadata.insert("source_type".to_string(), "json_parse".to_string());
-                        NodeKind::JsonParse
-                    },
-                    "get" => {
-                        metadata.insert("source_type".to_string(), "json_get".to_string());
-                        NodeKind::JsonGet
-                    },
-                    "str.upper" => {
-                        metadata.insert("source_type".to_string(), "string_upper".to_string());
-                        NodeKind::StringUpper
-                    },
-                    _ => {
-                        metadata.insert("source_type".to_string(), "function_call".to_string());
-                        metadata.insert("function_name".to_string(), op.clone());
-                        NodeKind::List
-                    }
-                };
-                
-                // Reconstruct source code
-                let code_snippet = format!(
-                    "({})", 
-                    items.iter()
-                         .map(|item| match item {
-                             ExprAst::String(s, _) => format!("\"{}\"", s),
-                             _ => format!("{:?}", item)
-                                 .split('(').nth(0).unwrap_or("").to_lowercase()
-                                 .replace("symbol", &item_to_source_string(item))
-                                 .replace("number", &item_to_source_string(item))
-                                 .replace("list", &item_to_source_string(item))
-                         })
-                         .collect::<Vec<_>>()
-                         .join(" ")
-                );
-                
-                Node::new(node_kind, code_snippet, children, metadata)
-            } else {
-                // Generic list
-                metadata.insert("source_type".to_string(), "list".to_string());
-                
-                let code_snippet = format!(
-                    "({})", 
-                    items.iter()
-                         .map(|item| item_to_source_string(item))
-                         .collect::<Vec<_>>()
-                         .join(" ")
-                );
-                
-                Node::new(NodeKind::List, code_snippet, children, metadata)
-            }
-        }
-    }
-}
-
-// Helper function to convert ExprAst back to a string representation for code snippets
-fn item_to_source_string(item: &ExprAst) -> String {
-    match item {
-        ExprAst::Symbol(s, _) => s.clone(),
-        ExprAst::Number(n, _) => n.to_string(),
-        ExprAst::String(s, _) => format!("\"{}\"", s),
-        ExprAst::List(items, _) => {
-            format!("({})", items.iter().map(item_to_source_string).collect::<Vec<_>>().join(" "))
-        }
-    }
-}
-
-// Local future type that doesn't require Send
 type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 // NodeCache manages caching of evaluated values by node ID
@@ -795,6 +565,7 @@ pub struct NodeCache {
     last_update: HashMap<NodeId, String>, // ISO timestamp
     changed_nodes: std::collections::HashSet<NodeId>, // Tracks nodes changed in current run
     previously_seen: std::collections::HashSet<NodeId>, // Tracks all nodes seen before the current run
+    dependencies: HashMap<String, std::collections::HashSet<NodeId>>, // Maps symbol names to nodes that depend on them
 }
 
 impl NodeCache {
@@ -804,6 +575,7 @@ impl NodeCache {
             last_update: HashMap::new(),
             changed_nodes: std::collections::HashSet::new(),
             previously_seen: std::collections::HashSet::new(),
+            dependencies: HashMap::new(),
         }
     }
     
@@ -838,12 +610,29 @@ impl NodeCache {
         self.values.insert(id, value);
     }
     
+    // Record that a node depends on a symbol
+    pub fn add_dependency(&mut self, symbol_name: &str, node_id: NodeId) {
+        self.dependencies
+            .entry(symbol_name.to_string())
+            .or_insert_with(std::collections::HashSet::new)
+            .insert(node_id);
+    }
+    
+    // Mark nodes that depend on a symbol as changed
+    pub fn mark_dependents_changed(&mut self, symbol_name: &str) {
+        if let Some(dependent_nodes) = self.dependencies.get(symbol_name) {
+            for &node_id in dependent_nodes.iter() {
+                self.changed_nodes.insert(node_id);
+            }
+        }
+    }
+    
     // Check if a node was changed in the current cycle
     pub fn was_changed(&self, id: &NodeId) -> bool {
         self.changed_nodes.contains(id)
     }
     
-    // Manually mark a node as changed (for propagating changes up the tree)
+    // Manually mark a node as changed
     pub fn mark_changed(&mut self, id: NodeId) {
         self.changed_nodes.insert(id);
     }
@@ -886,7 +675,6 @@ impl NodeCache {
             return Ok(());
         }
         
-        
         let json = fs::read_to_string(path)?;
         let serializable_values: HashMap<String, String> = serde_json::from_str(&json)?;
         
@@ -924,35 +712,28 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
         // Get the node ID for easy reference
         let node_id = node.id;
         
-        // Check if we already have a cached result for this node that isn't a symbol
-        // Symbol nodes are re-evaluated if their underlying context value might have changed,
-        // or if the symbol itself is part of a definition that changes.
+        // Check if node is changed or if it's a symbol (which needs to be re-evaluated)
         if !matches!(&node.kind, NodeKind::Symbol(_)) {
-            if let Some(cached_value) = cache.get(&node_id) {
-                 // If this node or any of its children were not marked as changed in this cycle,
-                 // and it was seen before, we can potentially reuse the cache.
-                 // However, for simplicity and correctness, especially with 'def',
-                 // we will rely on the individual handlers to manage re-evaluation logic for now.
-                 // The main check is that if a node's *dependencies* change, it *must* re-evaluate.
-                 // The `cache.insert` at the end will determine if its own value changed.
-                return cached_value.clone();
+            // For non-symbol nodes, check if they're marked as changed
+            if !cache.was_changed(&node_id) {
+                if let Some(cached_value) = cache.get(&node_id) {
+                    return cached_value.clone();
+                }
             }
         }
         
         // Evaluate this node based on its kind
         let result = match &node.kind {
             NodeKind::Symbol(name) => {
-                // Symbol lookup
-                // Check cache first, but symbols can change if context changes,
-                // so a simple cache hit isn't always enough.
-                // However, the 'changed_nodes' tracking should help.
-                // If a 'def' changes a symbol, the 'def' node changes,
-                // and any node *using* that symbol should ideally be re-evaluated.
-                // This part is tricky and might need further refinement for optimal caching.
-                // For now, direct lookup is fine, caching happens at the end.
-                context.get(name)
+                // Add this node as a dependency of the symbol
+                cache.add_dependency(name, node_id);
+                
+                // Look up the symbol in the context
+                let result = context.get(name)
                     .cloned()
-                    .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", name)))
+                    .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", name)))?;
+                
+                Ok(result)
             },
             NodeKind::Number(n) => {
                 // Number literal
@@ -986,16 +767,27 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
                 let value_expr_node = &node.children[2];
                 let value = eval_node(value_expr_node, context, cache).await?;
                 
+                // Get old value of the variable if it exists
+                let old_value = context.get(&var_name).cloned();
+                
                 // Store in context
                 context.insert(var_name.clone(), value.clone());
+                
+                // If the value changed, mark all nodes that depend on this symbol as changed
+                if old_value.is_none() || old_value.as_ref() != Some(&value) {
+                    // This will cascade and mark all nodes that depend on this symbol as changed
+                    cache.mark_dependents_changed(&var_name);
+                    
+                    // Also record the dependency for future tracking
+                    cache.add_dependency(&var_name, node_id);
+                }
                 
                 // 'def' itself evaluates to the value assigned
                 Ok(value)
             },
             NodeKind::Addition => {
                 // Addition (+ a b c ...)
-                // Children: 0: '+' symbol, 1...N: arguments
-                if node.children.len() < 2 { // Needs at least operator and one arg for meaningful operation
+                if node.children.len() < 2 {
                     return Err(Error::EvalError("'+' requires at least 1 argument".to_string()));
                 }
                 
@@ -1015,7 +807,6 @@ pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value
             },
             NodeKind::Multiplication => {
                 // Multiplication (* a b c ...)
-                // Children: 0: '*' symbol, 1...N: arguments
                 if node.children.len() < 2 {
                     return Err(Error::EvalError("'*' requires at least 1 argument".to_string()));
                 }

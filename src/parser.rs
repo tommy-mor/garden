@@ -39,6 +39,7 @@ fn parse_expr(pair: Pair<Rule>) -> Result<ExprAst, Error> {
     // Get source position for span information
     let span = SourceSpan {
         line: pair.line_col().0, // 1-indexed line number from pest
+        original_text: pair.as_str().to_string(), // Store original source text
     };
     
     match pair.as_rule() {
