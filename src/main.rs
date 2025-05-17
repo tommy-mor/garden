@@ -4,9 +4,14 @@ use serde_json::Value as JsonValue;
 use indexmap::IndexMap;
 use reqwest;
 use std::error::Error as StdError;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Future};
+use std::pin::Pin;
 use notify::{Watcher, RecursiveMode, recommended_watcher};
 use chrono;
+use std::rc::Rc;
+use std::hash::{Hash, Hasher};
+use blake3;
+use hex;
 
 // === TYPES ===
 
@@ -18,6 +23,131 @@ enum ExprAst {
     String(String),
 }
 
+// Node ID based on content hash
+type NodeId = [u8; 32]; // 32 bytes for BLAKE3 hash
+
+// Kind of node for evaluation purposes
+#[derive(Debug, Clone, PartialEq)]
+enum NodeKind {
+    Symbol(String),
+    Number(i64),
+    String(String),
+    List,
+    // More specific operations could be added here
+    Definition,
+    Addition,
+    Multiplication,
+    HttpGet,
+    JsonParse,
+    JsonGet,
+    StringUpper,
+}
+
+// Immutable computation tree node
+#[derive(Debug, Clone)]
+pub struct Node {
+    id: NodeId,                      // Content-based hash for identity
+    kind: NodeKind,                  // The kind of operation this node represents
+    code_snippet: String,            // Original source code
+    children: Vec<Rc<Node>>,         // Child nodes - immutable references
+    cached_value: Option<Result<Value, Error>>, // Last evaluated result
+    metadata: HashMap<String, String>, // Source location, timestamps, etc.
+}
+
+impl Node {
+    // Create a new node and compute its hash
+    pub fn new(
+        kind: NodeKind,
+        code_snippet: String,
+        children: Vec<Rc<Node>>,
+        metadata: HashMap<String, String>,
+    ) -> Rc<Self> {
+        // Compute hash based on kind, code, and children
+        let id = Self::compute_hash(&kind, &code_snippet, &children);
+        
+        Rc::new(Self {
+            id,
+            kind,
+            code_snippet,
+            children,
+            cached_value: None,
+            metadata,
+        })
+    }
+    
+    // Compute a structural hash based on the node's content and its children
+    fn compute_hash(kind: &NodeKind, code: &str, children: &[Rc<Node>]) -> NodeId {
+        let mut hasher = blake3::Hasher::new();
+        
+        // Add kind discriminator
+        match kind {
+            NodeKind::Symbol(s) => {
+                hasher.update(b"Symbol:");
+                hasher.update(s.as_bytes());
+            }
+            NodeKind::Number(n) => {
+                hasher.update(b"Number:");
+                hasher.update(&n.to_le_bytes());
+            }
+            NodeKind::String(s) => {
+                hasher.update(b"String:");
+                hasher.update(s.as_bytes());
+            }
+            NodeKind::List => {
+                hasher.update(b"List");
+            }
+            NodeKind::Definition => {
+                hasher.update(b"Definition");
+            }
+            NodeKind::Addition => {
+                hasher.update(b"Addition");
+            }
+            NodeKind::Multiplication => {
+                hasher.update(b"Multiplication");
+            }
+            NodeKind::HttpGet => {
+                hasher.update(b"HttpGet");
+            }
+            NodeKind::JsonParse => {
+                hasher.update(b"JsonParse");
+            }
+            NodeKind::JsonGet => {
+                hasher.update(b"JsonGet");
+            }
+            NodeKind::StringUpper => {
+                hasher.update(b"StringUpper");
+            }
+        }
+        
+        // Add code snippet
+        hasher.update(code.as_bytes());
+        
+        // Add children's hashes
+        for child in children {
+            hasher.update(&child.id);
+        }
+        
+        // Finalize hash
+        *hasher.finalize().as_bytes()
+    }
+    
+    // Get the node's ID
+    pub fn id(&self) -> &NodeId {
+        &self.id
+    }
+    
+    // Get cached value if any
+    pub fn cached_value(&self) -> Option<&Result<Value, Error>> {
+        self.cached_value.as_ref()
+    }
+    
+    // Set cached value
+    pub fn with_cached_value(mut self, value: Result<Value, Error>) -> Self {
+        self.cached_value = Some(value);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Number(i64),
@@ -25,7 +155,7 @@ pub enum Value {
     Json(JsonValue),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     ParseError(String),
     EvalError(String),
@@ -371,6 +501,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: Could not load cached values: {}", e);
     }
     
+    // Initialize the node cache
+    let mut node_cache = NodeCache::new();
+    
     // Create a channel to receive file change events
     let (tx, rx) = mpsc::channel();
     
@@ -383,11 +516,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Garden is watching {}...", file_path.display());
     println!("(Press Ctrl+C to exit)");
     
-    // Create a context from ValueCache for evaluation
+    // Create a context for evaluation
     let mut context: IndexMap<String, Value> = IndexMap::new();
     
     // Initial run
-    if let Err(e) = run_once(file_path, &mut context).await {
+    if let Err(e) = run_once(file_path, &mut context, &mut node_cache).await {
         eprintln!("Error: {}", e);
     }
     
@@ -403,7 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for res in rx {
         match res {
             Ok(_) => {
-                if let Err(e) = run_once(file_path, &mut context).await {
+                if let Err(e) = run_once(file_path, &mut context, &mut node_cache).await {
                     eprintln!("Error: {}", e);
                 } else {
                     // Update cache and save after successful run
@@ -422,7 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_once(path: &Path, context: &mut IndexMap<String, Value>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_once(path: &Path, context: &mut IndexMap<String, Value>, node_cache: &mut NodeCache) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nRevaluating expressions in {}...", path.display());
     
     let src = fs::read_to_string(path)?;
@@ -431,8 +564,23 @@ async fn run_once(path: &Path, context: &mut IndexMap<String, Value>) -> Result<
     // Get the source lines for better display
     let source_lines: Vec<&str> = src.lines().collect();
     
-    for (i, node) in ast_nodes.iter().enumerate() {
-        let result = eval(node, context).await?;
+    // Convert AST to Node Tree (immutable, structurally-hashed)
+    let mut roots = Vec::new();
+    for node in &ast_nodes {
+        roots.push(ast_to_node_tree(node));
+    }
+    
+    println!("Evaluation results:");
+    for (i, root) in roots.iter().enumerate() {
+        // Display node ID (hash)
+        let id_hex = hex::encode(&root.id[0..4]); // First 4 bytes for display
+        
+        // Check if we already have this node in cache
+        let is_cached = node_cache.get(&root.id).is_some();
+        let cache_status = if is_cached { "(cached)" } else { "" };
+        
+        // Evaluate using the new memoized evaluator
+        let result = eval_node(root, context, node_cache).await?;
         
         // For multiline expressions, this is simplified
         let line_num = i + 1;
@@ -443,9 +591,9 @@ async fn run_once(path: &Path, context: &mut IndexMap<String, Value>) -> Result<
         };
         
         // Format the output with colors (using ANSI escape codes)
-        // Clear the line, print source, then append value with green color
-        println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;32m=> {:?}\x1B[0m", 
-                 line_num, source, result);
+        // Clear the line, print source, node ID, then append value with green color
+        println!("\x1B[2K\x1B[0;1m{:>3}|\x1B[0m {} \x1B[0;36m[{} {}]\x1B[0m \x1B[0;32m=> {:?}\x1B[0m", 
+                 line_num, source, id_hex, cache_status, result);
     }
     
     Ok(())
@@ -517,6 +665,346 @@ pub async fn evaluate_form(code: &str, context: &mut IndexMap<String, Value>) ->
     }
 
     last_result.ok_or_else(|| Error::EvalError("No result found".to_string()))
+}
+
+// === Node Evaluation ===
+
+// Convert from ExprAst to Node tree
+fn ast_to_node_tree(ast: &ExprAst) -> Rc<Node> {
+    match ast {
+        ExprAst::Symbol(s) => {
+            let mut metadata = HashMap::new();
+            metadata.insert("source_type".to_string(), "symbol".to_string());
+            
+            Node::new(
+                NodeKind::Symbol(s.clone()),
+                s.clone(),
+                Vec::new(),
+                metadata
+            )
+        },
+        ExprAst::Number(n) => {
+            let mut metadata = HashMap::new();
+            metadata.insert("source_type".to_string(), "number".to_string());
+            
+            Node::new(
+                NodeKind::Number(*n),
+                n.to_string(),
+                Vec::new(),
+                metadata
+            )
+        },
+        ExprAst::String(s) => {
+            let mut metadata = HashMap::new();
+            metadata.insert("source_type".to_string(), "string".to_string());
+            
+            let code_snippet = format!("\"{}\"", s);
+            Node::new(
+                NodeKind::String(s.clone()),
+                code_snippet,
+                Vec::new(),
+                metadata
+            )
+        },
+        ExprAst::List(items) => {
+            if items.is_empty() {
+                let mut metadata = HashMap::new();
+                metadata.insert("source_type".to_string(), "empty_list".to_string());
+                
+                return Node::new(
+                    NodeKind::List,
+                    "()".to_string(),
+                    Vec::new(),
+                    metadata
+                );
+            }
+            
+            // Create child nodes
+            let children: Vec<Rc<Node>> = items.iter().map(ast_to_node_tree).collect();
+            
+            // Determine the operation type from the first item if it's a symbol
+            if let ExprAst::Symbol(op) = &items[0] {
+                let mut metadata = HashMap::new();
+                let node_kind = match op.as_str() {
+                    "def" => {
+                        metadata.insert("source_type".to_string(), "definition".to_string());
+                        NodeKind::Definition
+                    },
+                    "+" => {
+                        metadata.insert("source_type".to_string(), "addition".to_string());
+                        NodeKind::Addition
+                    },
+                    "*" => {
+                        metadata.insert("source_type".to_string(), "multiplication".to_string());
+                        NodeKind::Multiplication
+                    },
+                    "http.get" => {
+                        metadata.insert("source_type".to_string(), "http_get".to_string());
+                        NodeKind::HttpGet
+                    },
+                    "json.parse" => {
+                        metadata.insert("source_type".to_string(), "json_parse".to_string());
+                        NodeKind::JsonParse
+                    },
+                    "get" => {
+                        metadata.insert("source_type".to_string(), "json_get".to_string());
+                        NodeKind::JsonGet
+                    },
+                    "str.upper" => {
+                        metadata.insert("source_type".to_string(), "string_upper".to_string());
+                        NodeKind::StringUpper
+                    },
+                    _ => {
+                        metadata.insert("source_type".to_string(), "function_call".to_string());
+                        metadata.insert("function_name".to_string(), op.clone());
+                        NodeKind::List
+                    }
+                };
+                
+                // Reconstruct source code
+                let code_snippet = format!(
+                    "({})", 
+                    items.iter()
+                         .map(|item| match item {
+                             ExprAst::String(s) => format!("\"{}\"", s),
+                             _ => format!("{:?}", item).replace("ExprAst::", "")
+                         })
+                         .collect::<Vec<_>>()
+                         .join(" ")
+                );
+                
+                Node::new(node_kind, code_snippet, children, metadata)
+            } else {
+                // Generic list
+                let mut metadata = HashMap::new();
+                metadata.insert("source_type".to_string(), "list".to_string());
+                
+                // Reconstruct source code
+                let code_snippet = format!(
+                    "({})", 
+                    items.iter()
+                         .map(|item| format!("{:?}", item).replace("ExprAst::", ""))
+                         .collect::<Vec<_>>()
+                         .join(" ")
+                );
+                
+                Node::new(NodeKind::List, code_snippet, children, metadata)
+            }
+        }
+    }
+}
+
+// Local future type that doesn't require Send
+type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
+// NodeCache manages caching of evaluated values by node ID
+#[derive(Debug, Default)]
+pub struct NodeCache {
+    values: HashMap<NodeId, Result<Value, Error>>,
+    last_update: HashMap<NodeId, String>, // ISO timestamp
+}
+
+impl NodeCache {
+    pub fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+            last_update: HashMap::new(),
+        }
+    }
+    
+    pub fn get(&self, id: &NodeId) -> Option<&Result<Value, Error>> {
+        self.values.get(id)
+    }
+    
+    pub fn insert(&mut self, id: NodeId, value: Result<Value, Error>) {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.last_update.insert(id, now);
+        self.values.insert(id, value);
+    }
+    
+    // Additional methods for loading/saving cache to be implemented
+}
+
+// Memoized evaluation of a Node tree - this function embodies the core reactivity of Garden
+pub fn eval_node<'a>(node: &'a Rc<Node>, context: &'a mut IndexMap<String, Value>, cache: &'a mut NodeCache) 
+    -> LocalBoxFuture<'a, Result<Value, Error>> {
+    Box::pin(async move {
+        // Check if we already have a cached result for this node
+        if let Some(cached_result) = cache.get(&node.id) {
+            return cached_result.clone();
+        }
+        
+        // If not in cache, we need to evaluate
+        let result = match &node.kind {
+            NodeKind::Symbol(name) => {
+                // Symbol lookup
+                context.get(name)
+                    .cloned()
+                    .ok_or_else(|| Error::EvalError(format!("Undefined symbol: {}", name)))
+            },
+            NodeKind::Number(n) => {
+                // Number literal
+                Ok(Value::Number(*n))
+            },
+            NodeKind::String(s) => {
+                // String literal
+                Ok(Value::String(s.clone()))
+            },
+            NodeKind::Definition => {
+                // Definition (def name value)
+                if node.children.len() != 3 {
+                    return Err(Error::EvalError(format!(
+                        "'def' expects 2 arguments, got {}",
+                        node.children.len() - 1
+                    )));
+                }
+                
+                // Get symbol name from first argument
+                if let NodeKind::Symbol(var_name) = &node.children[1].kind {
+                    // Evaluate the value (second argument)
+                    let value = eval_node(&node.children[2], context, cache).await?;
+                    
+                    // Store in context
+                    context.insert(var_name.clone(), value.clone());
+                    Ok(value)
+                } else {
+                    Err(Error::EvalError("'def' first argument must be a symbol".to_string()))
+                }
+            },
+            NodeKind::Addition => {
+                // Addition (+ a b c ...)
+                let mut sum = 0;
+                
+                // Skip the operator node (first child)
+                for child in &node.children[1..] {
+                    match eval_node(child, context, cache).await? {
+                        Value::Number(n) => sum += n,
+                        _ => return Err(Error::EvalError("'+' requires number arguments".to_string())),
+                    }
+                }
+                
+                Ok(Value::Number(sum))
+            },
+            NodeKind::Multiplication => {
+                // Multiplication (* a b c ...)
+                let mut product = 1;
+                
+                // Skip the operator node (first child)
+                for child in &node.children[1..] {
+                    match eval_node(child, context, cache).await? {
+                        Value::Number(n) => product *= n,
+                        _ => return Err(Error::EvalError("'*' requires number arguments".to_string())),
+                    }
+                }
+                
+                Ok(Value::Number(product))
+            },
+            NodeKind::HttpGet => {
+                // HTTP GET (http.get url)
+                if node.children.len() != 2 {
+                    return Err(Error::EvalError(
+                        "'http.get' expects 1 argument (url)".into(),
+                    ));
+                }
+                
+                match eval_node(&node.children[1], context, cache).await? {
+                    Value::String(url) => {
+                        let body = reqwest::get(&url).await?.text().await?;
+                        Ok(Value::String(body))
+                    }
+                    _ => Err(Error::EvalError(
+                        "'http.get' expects a string argument".into(),
+                    )),
+                }
+            },
+            NodeKind::JsonParse => {
+                // JSON Parse (json.parse json_string)
+                if node.children.len() != 2 {
+                    return Err(Error::EvalError(
+                        "'json.parse' expects 1 argument (string)".into(),
+                    ));
+                }
+                
+                match eval_node(&node.children[1], context, cache).await? {
+                    Value::String(s) => {
+                        let json_data: JsonValue = serde_json::from_str(&s)?;
+                        Ok(Value::Json(json_data))
+                    }
+                    _ => Err(Error::EvalError(
+                        "'json.parse' expects a string argument".into(),
+                    )),
+                }
+            },
+            NodeKind::JsonGet => {
+                // JSON Get (get json_obj key)
+                if node.children.len() != 3 {
+                    return Err(Error::EvalError(
+                        "'get' expects 2 arguments (json, key)".into(),
+                    ));
+                }
+                
+                let json_arg = eval_node(&node.children[1], context, cache).await?;
+                let key_arg = eval_node(&node.children[2], context, cache).await?;
+                
+                match (&json_arg, &key_arg) {
+                    (Value::Json(json), Value::String(key)) => {
+                        match json.get(key) {
+                            Some(v) => convert_json_value(v.clone()),
+                            None => Err(Error::EvalError(format!(
+                                "Key '{}' not found in JSON object",
+                                key
+                            ))),
+                        }
+                    }
+                    _ => Err(Error::EvalError(format!(
+                        "'get' expects (json, string) arguments, got ({:?}, {:?})",
+                        &json_arg, &key_arg
+                    ))),
+                }
+            },
+            NodeKind::StringUpper => {
+                // String to uppercase (str.upper string)
+                if node.children.len() != 2 {
+                    return Err(Error::EvalError(
+                        "'str.upper' expects 1 argument (string)".into(),
+                    ));
+                }
+                
+                match eval_node(&node.children[1], context, cache).await? {
+                    Value::String(s) => {
+                        Ok(Value::String(s.to_uppercase()))
+                    }
+                    _ => Err(Error::EvalError(
+                        "'str.upper' expects a string argument".into(),
+                    )),
+                }
+            },
+            NodeKind::List => {
+                // Generic list or unknown function call
+                if node.children.is_empty() {
+                    return Err(Error::EvalError("Cannot evaluate empty list".to_string()));
+                }
+                
+                // If first child is a symbol, it should be a function
+                if let NodeKind::Symbol(func_name) = &node.children[0].kind {
+                    Err(Error::EvalError(format!(
+                        "Unknown function '{}' encountered",
+                        func_name
+                    )))
+                } else {
+                    Err(Error::EvalError(format!(
+                        "Cannot evaluate non-function list: {:?}",
+                        node.code_snippet
+                    )))
+                }
+            }
+        };
+        
+        // Cache the result before returning
+        cache.insert(node.id, result.clone());
+        
+        result
+    })
 }
 
 

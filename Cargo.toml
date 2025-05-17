@@ -16,3 +16,5 @@ bytes = "1" # Added for buffer management
 futures = "0.3" # For BoxFuture
 notify = "8.0.0"
 chrono = "0.4.41"
+blake3 = "1.8.2"
+hex = "0.4.3"

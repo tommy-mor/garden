@@ -1,8 +1,11 @@
 {
   "y": {
-    "Number": 10
+    "Number": 20
   },
   "x": {
-    "Number": 5
+    "Number": 10
+  },
+  "z": {
+    "Number": 30
   }
 }
